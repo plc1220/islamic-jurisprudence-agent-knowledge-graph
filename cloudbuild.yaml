@@ -31,7 +31,7 @@ steps:
       - '3000'
       # Production Environment Configuration
       - '--set-env-vars'
-      - 'NODE_ENV=production'
+      - 'NODE_ENV=production,CRAWLER_MODEL=gemini-3.1-flash-lite,CHAT_MODEL=gemini-3.5-flash,EXTRACTOR_MODEL=gemini-3.5-flash'
       # Securely fetch sensitive tokens from Secret Manager
       - '--set-secrets'
       - 'GEMINI_API_KEY=GEMINI_API_KEY:latest'

@@ -4,8 +4,35 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import pg from "pg";
+import fs from "fs";
 
 dotenv.config();
+
+// ==========================================
+// CENTRAL CONFIGURATION & MODEL RESOLUTION
+// ==========================================
+let modelConfig = {
+  CRAWLER_MODEL: "gemini-3.1-flash-lite",
+  CHAT_MODEL: "gemini-3.5-flash",
+  EXTRACTOR_MODEL: "gemini-3.5-flash"
+};
+
+try {
+  const configPath = path.join(process.cwd(), "config.json");
+  if (fs.existsSync(configPath)) {
+    const rawConfig = fs.readFileSync(configPath, "utf8");
+    const parsedConfig = JSON.parse(rawConfig);
+    modelConfig = { ...modelConfig, ...parsedConfig };
+    console.log("Configuration loaded successfully from config.json:", modelConfig);
+  }
+} catch (e: any) {
+  console.log("Configuration Warning: Could not read config.json, using defaults.", e.message);
+}
+
+// Allow environment variables to override the config file
+const CRAWLER_MODEL = process.env.CRAWLER_MODEL || modelConfig.CRAWLER_MODEL;
+const CHAT_MODEL = process.env.CHAT_MODEL || modelConfig.CHAT_MODEL;
+const EXTRACTOR_MODEL = process.env.EXTRACTOR_MODEL || modelConfig.EXTRACTOR_MODEL;
 
 const app = express();
 const PORT = 3000;
@@ -441,9 +468,9 @@ async function extractCleanContent(url: string, ai: GoogleGenAI): Promise<{ titl
       .replace(/<svg\b[^<]*(?:(?!<\/svg>)<[^<]*)*<\/svg>/gi, "")
       .replace(/<!--[\s\S]*?-->/g, "");
 
-    // Use gemini-2.0-flash-lite as requested: fast, cheap and perfect for structuring unstructured HTML
+    // Use dynamic CRAWLER_MODEL (default: gemini-3.1-flash-lite) for cost-optimal and fast HTML parsing
     const responseAi = await ai.models.generateContent({
-      model: "gemini-2.0-flash-lite",
+      model: CRAWLER_MODEL,
       contents: `Berdasarkan kod HTML berikut, sila keluarkan tajuk rencana utama dan isi kandungan teks utamanya sahaja. 
 Abaikan semua menu navigasi, iklan, pautan sidebar, pengisytiharan kuki, dan maklumat footer. 
 Sila kembalikan jawapan dalam format JSON dengan dua medan: "title" (tajuk rencana) dan "content" (teks penuh rencana yang bersih).
@@ -681,7 +708,7 @@ async function ingestURLContent(url: string, ai: GoogleGenAI): Promise<{ chunksC
   const prompt = `Analisis kandungan berikut daripada plans rencana "${title}": "${content.substring(0, 9000)}". Kenalpasti entiti perundangan Islam dan kaitannya, kemudian bina graf pengetahuan.`;
 
   const response = await ai.models.generateContent({
-    model: "gemini-3.5-flash",
+    model: EXTRACTOR_MODEL,
     contents: prompt,
     config: {
       systemInstruction,
@@ -852,7 +879,7 @@ app.post("/api/chat", async (req, res) => {
     const contents = [...formattedHistory, { role: "user", parts: [{ text: message }] }];
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: CHAT_MODEL,
       contents,
       config: {
         systemInstruction: finalSystemInstruction,
@@ -907,7 +934,7 @@ app.post("/api/extract-graph", async (req, res) => {
     const prompt = `Analisis teks atau topik berikut: "${text}". Kenalpasti entiti perundangan Islam dan kaitannya, kemudian bina graf pengetahuan. Hubungkan entiti dengan sumber sahih fiqh, fatwa Malaysia, hukum yang berkenaan, serta rujukan yang sesuai.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: EXTRACTOR_MODEL,
       contents: prompt,
       config: {
         systemInstruction,

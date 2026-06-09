@@ -43,9 +43,15 @@ export function ParserSimulator({
     setRawOutput(null);
 
     try {
+      const localKey = localStorage.getItem("mursyid_gemini_api_key") || "";
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (localKey) {
+        headers["Authorization"] = `Bearer ${localKey}`;
+      }
+
       const response = await fetch("/api/extract-graph", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ text }),
       });
 

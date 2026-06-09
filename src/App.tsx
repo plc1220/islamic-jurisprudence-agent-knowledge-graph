@@ -17,6 +17,7 @@ import {
   Search,
   CheckCircle2,
   Lock,
+  Key,
 } from "lucide-react";
 
 import { ChatMessage, KnowledgeNode, KnowledgeLink, SourceWebsite, PresetQuestion } from "./types";
@@ -29,6 +30,7 @@ import { ParserSimulator } from "./components/ParserSimulator";
 export default function App() {
   // Navigation State
   const [activeTab, setActiveTab] = useState<"chat" | "graph" | "sources" | "engineering">("chat");
+  const [localApiKey, setLocalApiKey] = useState<string>(localStorage.getItem("mursyid_gemini_api_key") || "");
 
   // Chat State
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
@@ -91,9 +93,14 @@ export default function App() {
         content: m.content
       }));
 
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (localApiKey) {
+        headers["Authorization"] = `Bearer ${localApiKey}`;
+      }
+
       const response = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ message: textToSend, history: serverHistory })
       });
 
@@ -131,11 +138,51 @@ export default function App() {
     }
   };
 
+  // Load the persisted Knowledge Graph on mount
+  useEffect(() => {
+    const loadGraph = async () => {
+      try {
+        const response = await fetch("/api/get-graph");
+        const data = await response.json();
+        if (response.ok && data.nodes && data.links) {
+          setNodes(data.nodes);
+          setLinks(data.links);
+          if (data.nodes.length > 0) {
+            setSelectedNode(data.nodes[0]);
+          }
+        }
+      } catch (err) {
+        console.error("Gagal mendapatkan graf asas daripada pelayan:", err);
+      }
+    };
+    loadGraph();
+  }, []);
+
   // Reset the Knowledge Graph back to pristine original Shafi'i ontology
-  const handleResetGraph = () => {
-    setNodes(INITIAL_NODES);
-    setLinks(INITIAL_LINKS);
-    setSelectedNode(INITIAL_NODES[0]);
+  const handleResetGraph = async () => {
+    try {
+      const response = await fetch("/api/reset-graph", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" }
+      });
+      const data = await response.json();
+      if (response.ok && data.nodes && data.links) {
+        setNodes(data.nodes);
+        setLinks(data.links);
+        if (data.nodes.length > 0) {
+          setSelectedNode(data.nodes[0]);
+        }
+      } else {
+        setNodes(INITIAL_NODES);
+        setLinks(INITIAL_LINKS);
+        setSelectedNode(INITIAL_NODES[0]);
+      }
+    } catch (err) {
+      console.error("Gagal menetapkan semula graf di pelayan, menetapkan semula secara lokal:", err);
+      setNodes(INITIAL_NODES);
+      setLinks(INITIAL_LINKS);
+      setSelectedNode(INITIAL_NODES[0]);
+    }
     setSuccessNotice("Berjaya mengembalikan sistem ontologi fekah kepada struktur asas Mazhab Syafi'i.");
   };
 
@@ -180,13 +227,26 @@ export default function App() {
           </div>
 
           {/* Quick source link counts to make header intuitive */}
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className="text-[10px] font-sans font-semibold text-[#6D685E] bg-[#EAE7DF] border border-[#D4D0C6] px-3 py-1 rounded-full">
               MAZHAB UTAMA: <span className="text-[#5A634A] font-bold">SYAFI'I</span>
             </span>
             <span className="text-[10px] font-sans font-semibold text-[#6D685E] bg-[#EAE7DF] border border-[#D4D0C6] px-3 py-1 rounded-full">
               SUMBER BERSEPADU: <span className="text-[#A48F68] font-bold">10 PORTAL RASMI</span>
             </span>
+            <div className="flex items-center gap-1.5 bg-[#EAE7DF]/60 border border-[#D4D0C6] px-3 py-1 rounded-full shadow-inner">
+              <Key className="w-3 h-3 text-[#5A634A]" />
+              <input
+                type="password"
+                placeholder="Gemini API Key..."
+                value={localApiKey}
+                onChange={(e) => {
+                  setLocalApiKey(e.target.value);
+                  localStorage.setItem("mursyid_gemini_api_key", e.target.value);
+                }}
+                className="bg-transparent border-none text-[10px] text-[#2D2B26] focus:outline-none w-28 placeholder:text-[#8A8478]/70 font-sans"
+              />
+            </div>
           </div>
         </div>
       </header>

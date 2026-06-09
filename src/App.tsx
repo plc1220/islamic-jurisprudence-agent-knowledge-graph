@@ -26,6 +26,7 @@ import { KnowledgeGraph } from "./components/KnowledgeGraph";
 import { SourceCard } from "./components/SourceCard";
 import { ArchitectureExplainer } from "./components/ArchitectureExplainer";
 import { ParserSimulator } from "./components/ParserSimulator";
+import { CrawlerPanel } from "./components/CrawlerPanel";
 
 export default function App() {
   // Navigation State
@@ -138,24 +139,26 @@ export default function App() {
     }
   };
 
+  // Reusable graph refresh function
+  const refreshGraph = async () => {
+    try {
+      const response = await fetch("/api/get-graph");
+      const data = await response.json();
+      if (response.ok && data.nodes && data.links) {
+        setNodes(data.nodes);
+        setLinks(data.links);
+        if (data.nodes.length > 0) {
+          setSelectedNode(data.nodes[0]);
+        }
+      }
+    } catch (err) {
+      console.error("Gagal mendapatkan graf daripada pelayan:", err);
+    }
+  };
+
   // Load the persisted Knowledge Graph on mount
   useEffect(() => {
-    const loadGraph = async () => {
-      try {
-        const response = await fetch("/api/get-graph");
-        const data = await response.json();
-        if (response.ok && data.nodes && data.links) {
-          setNodes(data.nodes);
-          setLinks(data.links);
-          if (data.nodes.length > 0) {
-            setSelectedNode(data.nodes[0]);
-          }
-        }
-      } catch (err) {
-        console.error("Gagal mendapatkan graf asas daripada pelayan:", err);
-      }
-    };
-    loadGraph();
+    refreshGraph();
   }, []);
 
   // Reset the Knowledge Graph back to pristine original Shafi'i ontology
@@ -323,6 +326,21 @@ export default function App() {
           <div className="p-3 bg-emerald-950/45 border border-emerald-500/30 text-emerald-300 rounded-lg text-xs text-left flex items-center gap-2 animate-pulse">
             <span className="w-2 h-2 rounded-full bg-emerald-400 inline-block animate-ping" />
             {successNotice}
+          </div>
+        )}
+
+        {globalError && (
+          <div className="p-3 bg-rose-950/45 border border-rose-500/30 text-rose-300 rounded-lg text-xs text-left flex items-center justify-between gap-2 animate-pulse">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+              <span>{globalError}</span>
+            </div>
+            <button 
+              onClick={() => setGlobalError(null)} 
+              className="text-[10px] text-rose-400 hover:text-rose-200 cursor-pointer font-semibold underline px-1 shrink-0"
+            >
+              Tutup
+            </button>
           </div>
         )}
 
@@ -604,6 +622,25 @@ export default function App() {
                     </div>
                   </div>
 
+                </div>
+
+                {/* Crawler and Batch Indexer Panel */}
+                <div className="border-t border-[#E5E1D8] pt-6 pb-2">
+                  <div className="text-left mb-4">
+                    <h4 className="font-serif font-semibold text-[#2D2B26] flex items-center gap-1.5">
+                      <Globe className="w-4.5 h-4.5 text-[#5A634A]" />
+                      Sistem Perayap Laman Web & Saluran Ingestasi (Knowledge Graph Ingestion)
+                    </h4>
+                    <p className="text-[11px] text-[#8A8478]">
+                      Gunakan enjin ini untuk merayap dan mengindeks kandungan fatwa kontemporari secara real-time dari pangkalan web rasmi agensi Malaysia.
+                    </p>
+                  </div>
+
+                  <CrawlerPanel
+                    apiKey={localApiKey}
+                    onIndexComplete={refreshGraph}
+                    setError={setGlobalError}
+                  />
                 </div>
 
                 {/* Parser Simulator panel at the bottom for interaction */}

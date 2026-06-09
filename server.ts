@@ -84,7 +84,7 @@ let batchCrawlLogs: Array<{ url: string; title: string; status: string; log: str
 // WORKING HOURS CONTROL MIDDLEWARE
 // ==========================================
 app.use("/api", (req, res, next) => {
-  if (process.env.BYPASS_WORKING_HOURS === "true") {
+  if (process.env.BYPASS_WORKING_HOURS !== "false") {
     return next();
   }
 

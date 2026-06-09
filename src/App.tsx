@@ -18,6 +18,7 @@ import {
   CheckCircle2,
   Lock,
   Key,
+  Globe,
 } from "lucide-react";
 
 import { ChatMessage, KnowledgeNode, KnowledgeLink, SourceWebsite, PresetQuestion } from "./types";

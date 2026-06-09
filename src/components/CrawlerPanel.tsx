@@ -193,7 +193,7 @@ export function CrawlerPanel({ apiKey, onIndexComplete, setError }: CrawlerPanel
         </span>
         Enjin rujukan Mursyid AI disokong oleh saluran paip (<span className="text-[#A48F68] font-medium font-serif">Data Ingestion Pipeline</span>) 
         yang mengindeks artikel, fatwa, dan panduan syarak secara terus dari laman web rasmi agensi agama Malaysia. 
-        Teks penuh akan dicleanse menggunakan model <span className="font-semibold text-[#5A634A]">gemini-2.0-flash-lite</span>, disegmenkan mengikut 
+        Teks penuh akan dicleanse menggunakan model <span className="font-semibold text-[#5A634A]">gemini-3.1-flash-lite</span>, disegmenkan mengikut 
         paragraf ke dalam <span className="font-semibold">pgvector</span>, manakala hubungan ontologi akan diekstrak ke dalam <span className="font-semibold">Apache AGE</span>.
       </div>
 

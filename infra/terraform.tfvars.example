@@ -1,0 +1,14 @@
+# GCP Project ID to deploy Mursyid AI to
+project_id = "YOUR_GCP_PROJECT_ID"
+
+# Region of deployment
+region = "asia-southeast1"
+
+# Service name on Cloud Run
+service_name = "mursyid-ai"
+
+# Artifact registry repository name
+repository_name = "mursyid-repo"
+
+# Strong password for Cloud SQL PostgreSQL administrator user
+postgres_db_password = "SUPER_SECURE_ADMIN_PASSWORD_123!"

@@ -1,0 +1,49 @@
+steps:
+  # 1. Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${_VERSION}'
+      - '.'
+
+  # 2. Push the container image to Google Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${_VERSION}'
+
+  # 3. Deploy the container image to Google Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${_VERSION}'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--port'
+      - '3000'
+      # Production Environment Configuration
+      - '--set-env-vars'
+      - 'NODE_ENV=production'
+      # Securely fetch sensitive tokens from Secret Manager
+      - '--set-secrets'
+      - 'GEMINI_API_KEY=GEMINI_API_KEY:latest'
+
+images:
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${_VERSION}'
+
+substitutions:
+  _REGION: 'asia-southeast1' # Default region (Singapore is closest to Malaysia for fast latency)
+  _REPOSITORY: 'mursyid-repo' # Target Google Artifact Registry repository
+  _SERVICE_NAME: 'mursyid-ai' # Target Cloud Run service name
+  _VERSION: 'latest' # Target version tag (default: latest, can be overwritten on CLI)
+
+options:
+  logging: CLOUD_LOGGING_ONLY

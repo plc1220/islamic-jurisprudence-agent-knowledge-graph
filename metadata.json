@@ -1,0 +1,6 @@
+{
+  "name": "Islamic Jurisprudence Agent & Knowledge Graph",
+  "description": "Sistem ejen kepakaran Islam Bahasa Melayu bersepadu dengan visualisasi Graf Pengetahuan dan integrasi data sahih JAKIM/Mufti WP.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

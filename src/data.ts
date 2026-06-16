@@ -87,9 +87,9 @@ export const OFFICIAL_SOURCES: SourceWebsite[] = [
 // Presets that target these reliable resources
 export const PRESET_QUESTIONS: PresetQuestion[] = [
   {
-    shortLabel: "💰 Pelaburan Kripto",
-    question: "Apakah status hukum perdagangan mata wang kripto (Cryptocurrency) menurut keputusan Majlis Kebangsaan Fatwa Malaysia?",
-    category: "Muamalah Kontemporari"
+    shortLabel: "📱 Iddah & Live Media",
+    question: "Berdasarkan katalog Mursyid, ringkaskan rujukan tentang wanita dalam iddah kematian suami buat live media sosial.",
+    category: "Kekeluargaan & Iddah"
   },
   {
     shortLabel: "⏳ Status Hadis Palsu",

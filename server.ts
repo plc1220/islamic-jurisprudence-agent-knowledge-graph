@@ -1702,7 +1702,7 @@ app.post("/api/chat", async (req, res) => {
       "Sentiasa utamakan pandangan Mazhab Syafi'i, keputusan Majlis Raja-Raja, fatwa JAKIM, e-Khutbah serta Jabatan Mufti Wilayah Persekutuan (muftiwp.gov.my). " +
       "Bahasa komunikasi mestilah Bahasa Melayu/Malaysia yang sopan, akademik, dan mudah difahami. " +
       "Cakap dengan sandaran dalil yang jelas dari Al-Quran dan Al-Sunnah jika bersesuaian, dan nyatakan sumber rujukan fatwa secara eksplisit. " +
-      "Apabila pengguna bertanyakan isu semasa (contohnya pelaburan kripto, vaksin, waktu solat), gunakan keputusan mufti yang sah di Malaysia.";
+      "Apabila pengguna bertanyakan isu semasa, gunakan hanya keputusan mufti yang sah di Malaysia apabila rujukannya wujud dalam katalog pengetahuan.";
 
 	    // GCP-native grounded retrieval layer
 		    let groundedContext = "";

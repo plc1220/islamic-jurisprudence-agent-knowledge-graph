@@ -979,7 +979,11 @@ function chunkCitation(chunk: RetrievedChunk): Citation {
 
 function getTextKeywordMatches(text: string, keywords: string[]): string[] {
   const normalized = text.toLowerCase();
-  return keywords.filter(keyword => normalized.includes(keyword.toLowerCase()));
+  return keywords.filter(keyword => {
+    const escapedKeyword = keyword.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const keywordPattern = new RegExp(`(^|[^a-z0-9])${escapedKeyword}([^a-z0-9]|$)`, "i");
+    return keywordPattern.test(normalized);
+  });
 }
 
 function filterRelevantChunks(chunks: RetrievedChunk[], keywords: string[]): RetrievedChunk[] {
@@ -1444,7 +1448,8 @@ function extractKeywords(text: string): string[] {
     "dari", "darihal", "tentang", "mengenai", "bagi", "seperti", "ia", "mereka", "kita",
     "kami", "kamu", "dia", "dalam", "sebagai", "akan", "telah", "sudah", "belum", "sedang",
     "boleh", "harus", "wajib", "hukum", "hukumnya", "status", "mengikut", "menurut", "keputusan",
-    "fatwa", "kebangsaan", "malaysia", "pejabat", "mufti", "bagaimanakah", "apakah", "siapa", "siapakah"
+    "fatwa", "kebangsaan", "malaysia", "pejabat", "mufti", "bagaimanakah", "apakah", "siapa", "siapakah",
+    "jawab", "ringkas", "sertakan", "asas", "rujukan", "sumber", "rasmi", "katalog", "mursyid", "berdasarkan"
   ]);
   
   const cleaned = text.toLowerCase()

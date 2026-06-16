@@ -1,133 +1,131 @@
-# Mursyid AI: CI/CD & Deployment Documentation
+# Mursyid AI: CI/CD & Deployment
 
-This document describes the continuous integration and continuous deployment (CI/CD) pipeline for **Mursyid AI**. The pipeline compiles the typescript backend and frontend assets, packages them inside a production Docker container, pushes the container image to Google Artifact Registry, and deploys it serverless to Google Cloud Run.
+This document describes the Google Cloud deployment path for Mursyid AI after the GCP-native knowledge platform migration. Cloud Run still hosts the app, while crawled knowledge is persisted through Cloud Storage, BigQuery, BigQuery Vector Search, and Knowledge Catalog.
 
----
-
-## 🏗️ Architecture Overview
-
-The CI/CD pipeline leverages Google Cloud Platform (GCP) native developer tools to achieve high security, isolation, and rapid delivery:
+## Architecture
 
 ```mermaid
 graph LR
-    Dev["Developer push / local CLI"] --> CB["Google Cloud Build"]
-    CB --> Docker["Docker Build & Compile"]
-    Docker --> GAR["Google Artifact Registry (GAR)"]
-    GAR --> CR["Google Cloud Run (Serverless)"]
-    Secret["Google Secret Manager"] -.-> |Mounted on Startup| CR
+    Dev["Developer / GitHub trigger"] --> GHA["GitHub Actions"]
+    GHA --> Docker["Docker build + TypeScript compile"]
+    Docker --> GAR["Artifact Registry"]
+    GAR --> CR["Cloud Run"]
+    WIF["Workload Identity Federation"] --> GHA
+    SA["Cloud Run runtime service account"] --> CR
+    CR --> C4AI["Crawl4AI + Chromium runtime"]
+    CR --> GCS["Cloud Storage raw markdown"]
+    CR --> BQ["BigQuery corpus, chunks, graph edges"]
+    BQ --> BQVS["BigQuery Vector Search"]
+    CR --> KC["Knowledge Catalog entries/aspects"]
+    CR --> Vertex["Gemini / Vertex AI"]
 ```
 
-1.  **Orchestrator:** **Google Cloud Build** reads the declarative definition in [cloudbuild.yaml](file:///Users/licheng.phan/Documents/islamic-jurisprudence-agent-&-knowledge-graph/cloudbuild.yaml).
-2.  **Artifact Storage:** Built container images are securely pushed to **Google Artifact Registry (GAR)**.
-3.  **Hosting Environment:** **Google Cloud Run** serves the container serverless. It auto-scales from $0$ to $N$ instances based on demand, reducing idle cloud computing fees to zero.
-4.  **Security (Secrets):** Sensitive credentials (like the `GEMINI_API_KEY`) are fetched securely from **Google Secret Manager** at deployment runtime.
+## GitHub Actions
 
----
+`.github/workflows/deploy-cloud-run.yml` is the preferred deployment path. It builds the Docker image with Buildx, reuses GitHub Actions layer caching, pushes both the commit SHA and `latest` tags to Artifact Registry, and deploys the SHA-tagged image to Cloud Run.
 
-## 🛠️ Pipeline Configurations (`cloudbuild.yaml`)
+The workflow runs on pushes to `main` and can also be started manually from the GitHub Actions tab.
 
-The deployment process is split into three core steps executed sequentially in Cloud Build:
+Required GitHub repository variables:
 
-### Step 1: Container Image Construction
-Builds a lightweight production-ready Docker container using the [Dockerfile](file:///Users/licheng.phan/Documents/islamic-jurisprudence-agent-&-knowledge-graph/Dockerfile):
-```yaml
-- name: 'gcr.io/cloud-builders/docker'
-  args:
-    - 'build'
-    - '-t'
-    - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${_VERSION}'
-    - '.'
-```
+| Variable | Example | Description |
+| :--- | :--- | :--- |
+| `GCP_PROJECT_ID` | `my-rd-coe-demo-gen-ai` | Google Cloud project. |
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | Terraform output `github_actions_workload_identity_provider` | OIDC provider used by `google-github-actions/auth`. |
+| `GCP_DEPLOY_SERVICE_ACCOUNT` | Terraform output `github_actions_deploy_service_account` | Service account GitHub Actions impersonates. |
 
-### Step 2: Push to Artifact Registry
-Pushes the newly built and versioned Docker image to the project's regional Docker repository:
-```yaml
-- name: 'gcr.io/cloud-builders/docker'
-  args:
-    - 'push'
-    - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${_VERSION}'
-```
+Optional variables override workflow defaults:
 
-### Step 3: Serverless Deployment to Cloud Run
-Instructs Google Cloud Run to roll out the container with updated configurations, automatic env mappings, and zero downtime:
-```yaml
-- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-  entrypoint: gcloud
-  args:
-    - 'run'
-    - 'deploy'
-    - '${_SERVICE_NAME}'
-    - '--image'
-    - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${_VERSION}'
-    - '--region'
-    - '${_REGION}'
-    - '--platform'
-    - 'managed'
-    - '--allow-unauthenticated'
-    - '--port'
-    - '3000'
-    # Environment Configurations
-    - '--set-env-vars'
-    - 'NODE_ENV=production,CRAWLER_MODEL=gemini-3.1-flash-lite,CHAT_MODEL=gemini-3.5-flash,EXTRACTOR_MODEL=gemini-3.5-flash'
-    # Secrets Mounting
-    - '--set-secrets'
-    - 'GEMINI_API_KEY=GEMINI_API_KEY:latest'
-```
+| Variable | Default |
+| :--- | :--- |
+| `GCP_REGION` | `asia-southeast1` |
+| `ARTIFACT_REGISTRY_REPOSITORY` | `mursyid-repo` |
+| `CLOUD_RUN_SERVICE` | `mursyid-ai` |
+| `GCS_RAW_BUCKET` | `my-rd-coe-demo-gen-ai-mursyid-raw` |
+| `GEMINI_LOCATION` | `global` |
+| `BQ_DATASET` | `mursyid_knowledge` |
 
----
+To create or update the GitHub OIDC deploy identity, apply Terraform and copy the outputs into GitHub repository variables:
 
-## ⚙️ Environment Variables & Secret Management
-
-Configuration variables are decoupled to ensure compliance with Twelve-Factor App methodology:
-
-### 1. Model & Environment Mappings
-Passed directly using the `--set-env-vars` flag:
-*   `NODE_ENV`: Tells Express and Vite to run in optimized production mode.
-*   `CRAWLER_MODEL`: Configured to `gemini-3.1-flash-lite` for cost-optimal and ultra-fast article cleansing.
-*   `CHAT_MODEL`: References the low-temperature grounding model (`gemini-3.5-flash`).
-*   `EXTRACTOR_MODEL`: References the graph extraction schema model (`gemini-3.5-flash`).
-*   `BYPASS_WORKING_HOURS`: Defaults to `true` (unconfigured environment variable defaults to bypass) to keep testing open 24/7. To restrict system availability to Malaysian working hours (Mon-Fri 8 AM - 6 PM), deploy with `BYPASS_WORKING_HOURS=false`.
-
-### 2. Secret Manager Integration
-Mounted via the `--set-secrets` flag. This ensures the sensitive Gemini API Token is never committed to GitHub or exposed in plain text. Secret values are injected directly into the instance's environment at the container boundary as `GEMINI_API_KEY`.
-
----
-
-## 🚀 How to Trigger Deployments
-
-You can trigger builds using manual CLI commands or configure continuous integration via source control triggers.
-
-### Method A: Manual Build & Deploy (GCP CLI)
-To deploy your current local workspace changes directly to GCP, execute the following command in the project root:
 ```bash
-gcloud builds submit --config=cloudbuild.yaml --project=my-rd-coe-demo-gen-ai
+cd infra
+terraform apply
+terraform output github_actions_workload_identity_provider
+terraform output github_actions_deploy_service_account
 ```
 
-### Method B: Automated Git Triggers (GitHub Integration)
-For production setups, you can bind Cloud Build triggers to your GitHub repository:
-1.  Navigate to **Cloud Build > Triggers** in the GCP Console.
-2.  Connect your GitHub repository: `plc1220/islamic-jurisprudence-agent-knowledge-graph`.
-3.  Configure a trigger:
-    *   **Event:** Push to a branch.
-    *   **Source Branch:** `^main$`
-    *   **Configuration:** Cloud Build configuration file (`cloudbuild.yaml`).
-4.  Save the trigger. Any commit pushed to the `main` branch will automatically launch a rolling, zero-downtime deployment.
+## Cloud Build (Legacy Manual Path)
 
----
+`cloudbuild.yaml` builds the Docker image, pushes it to Artifact Registry, and deploys Cloud Run with production runtime configuration:
 
-## 🔑 Customizing Pipeline Substitutions
+- `NODE_ENV=production`
+- `GOOGLE_GENAI_USE_ENTERPRISE=true`
+- `GOOGLE_GENAI_USE_VERTEXAI=true`
+- `GCP_PROJECT_ID`, `GCP_LOCATION`, `GOOGLE_CLOUD_PROJECT`
+- `GEMINI_LOCATION`, `GOOGLE_CLOUD_LOCATION`
+- `INGESTION_CRAWLER=crawl4ai`
+- `BQ_DATASET`, `BQ_CORPUS_TABLE`, `BQ_CHUNKS_TABLE`, `BQ_GRAPH_TABLE`
+- `BQ_EMBEDDING_MODEL`
+- `GCS_RAW_BUCKET`
+- `KNOWLEDGE_CATALOG_ENTRY_GROUP`, `KNOWLEDGE_CATALOG_ENTRY_TYPE`, `KNOWLEDGE_CATALOG_ASPECT_TYPE`
+- `MDCODE_EXPORT_DIR=/tmp/catalog-export`
 
-You can override default target parameters on manual builds using the `--substitutions` flag:
+The Cloud Run deployment uses 2 CPU, 4Gi memory, one max instance, always-allocated CPU, and a 900 second timeout so `/api/ingest-batch` can continue background crawling after the request returns. The single-instance cap keeps the current in-memory crawl status stable until this is moved to a durable queue/job runner.
+
+## Terraform
+
+The Terraform stack enables and provisions:
+
+- Cloud Run and Artifact Registry
+- BigQuery dataset for corpus/chunk/graph tables
+- Cloud Storage bucket for raw markdown snapshots
+- Knowledge Catalog / Dataplex API access
+- Vertex AI access for Gemini and embeddings through Application Default Credentials (ADC)
+- A dedicated Cloud Run runtime service account with BigQuery, Storage, Dataplex, and Vertex AI roles
+
+Gemini does not require a `GEMINI_API_KEY` in this deployment. The app uses the Google Gen AI SDK with `vertexai: true`; Cloud Run authenticates through the runtime service account, and local development should use ADC.
+
+The application creates BigQuery tables and the vector index lazily on startup or first ingestion. Knowledge Catalog custom types are also created lazily on first publish when the runtime service account has sufficient catalog permissions.
+
+## Manual Build
+
 ```bash
 gcloud builds submit \
   --config=cloudbuild.yaml \
-  --project=my-rd-coe-demo-gen-ai \
-  --substitutions=_REGION="us-central1",_VERSION="v1.0.0"
+  --project=YOUR_GCP_PROJECT_ID \
+  --substitutions=_REGION="asia-southeast1",_VERSION="latest",_GCS_RAW_BUCKET="YOUR_GCP_PROJECT_ID-mursyid-raw"
 ```
 
-| Substitution Variable | Default Value | Description |
+## Key Substitutions
+
+| Variable | Default | Description |
 | :--- | :--- | :--- |
-| `_REGION` | `asia-southeast1` | Deployment region (Singapore is closest to Malaysia for lowest latency). |
-| `_REPOSITORY` | `mursyid-repo` | Name of the Google Artifact Registry target repository. |
-| `_SERVICE_NAME` | `mursyid-ai` | Name of the Google Cloud Run serverless service. |
-| `_VERSION` | `latest` | Image tag versioning reference. |
+| `_REGION` | `asia-southeast1` | Cloud Run, BigQuery, Storage, and Knowledge Catalog region. |
+| `_REPOSITORY` | `mursyid-repo` | Artifact Registry repository. |
+| `_SERVICE_NAME` | `mursyid-ai` | Cloud Run service name. |
+| `_VERSION` | `latest` | Container image tag. |
+| `_GEMINI_LOCATION` | `global` | Gemini / Vertex AI model endpoint location. |
+| `_BQ_DATASET` | `mursyid_knowledge` | BigQuery dataset for native retrieval stores. |
+| `_BQ_CORPUS_TABLE` | `corpus` | Full crawled document table. |
+| `_BQ_CHUNKS_TABLE` | `chunks` | Chunk + embedding table used by vector search. |
+| `_BQ_GRAPH_TABLE` | `graph_edges` | Extracted graph edge table. |
+| `_GCS_RAW_BUCKET` | empty | Cloud Storage bucket for markdown snapshots; set this for production. |
+| `_KNOWLEDGE_CATALOG_ENTRY_GROUP` | `mursyid-knowledge` | Custom Knowledge Catalog entry group. |
+
+## Runtime Flow
+
+1. Crawl4AI returns clean markdown documents.
+2. Cloud Storage stores raw markdown snapshots when `GCS_RAW_BUCKET` is configured.
+3. BigQuery receives corpus rows, chunk embeddings, and extracted graph edges.
+4. BigQuery Vector Search retrieves grounded semantic chunks for `/api/chat`.
+5. Knowledge Catalog receives governed source and concept entries with custom aspects.
+6. A metadata-as-code export is written to `MDCODE_EXPORT_DIR` for review/debugging.
+
+## Local ADC Setup
+
+```bash
+gcloud auth application-default login
+gcloud config set project YOUR_GCP_PROJECT_ID
+```
+
+Then set `GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_GENAI_USE_ENTERPRISE=true`, `GOOGLE_GENAI_USE_VERTEXAI=true`, and `GEMINI_LOCATION=global` in your local environment.

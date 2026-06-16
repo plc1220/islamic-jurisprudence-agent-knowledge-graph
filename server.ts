@@ -3,8 +3,12 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
-import pg from "pg";
 import fs from "fs";
+import { spawn } from "child_process";
+import { createHash } from "crypto";
+import { BigQuery } from "@google-cloud/bigquery";
+import { Storage } from "@google-cloud/storage";
+import { GoogleAuth } from "google-auth-library";
 
 dotenv.config();
 
@@ -33,9 +37,28 @@ try {
 const CRAWLER_MODEL = process.env.CRAWLER_MODEL || modelConfig.CRAWLER_MODEL;
 const CHAT_MODEL = process.env.CHAT_MODEL || modelConfig.CHAT_MODEL;
 const EXTRACTOR_MODEL = process.env.EXTRACTOR_MODEL || modelConfig.EXTRACTOR_MODEL;
+const PYTHON_BIN = process.env.PYTHON_BIN || "python3";
+const CRAWL4AI_BRIDGE_PATH = process.env.CRAWL4AI_BRIDGE_PATH || path.join(process.cwd(), "scripts", "crawl4ai_bridge.py");
+const INGESTION_CRAWLER = (process.env.INGESTION_CRAWLER || "crawl4ai").toLowerCase();
+const CRAWL_MAX_DEPTH = Math.max(0, parseInt(process.env.CRAWL_MAX_DEPTH || "1", 10));
+const CRAWL_MAX_PAGES_PER_SOURCE = Math.max(1, parseInt(process.env.CRAWL_MAX_PAGES_PER_SOURCE || "3", 10));
+const CRAWL4AI_TIMEOUT_MS = Math.max(30_000, parseInt(process.env.CRAWL4AI_TIMEOUT_MS || "180000", 10));
+const GCP_PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || "";
+const GCP_LOCATION = process.env.GCP_LOCATION || "asia-southeast1";
+const GEMINI_LOCATION = process.env.GEMINI_LOCATION || process.env.GOOGLE_CLOUD_LOCATION || "global";
+const BQ_DATASET = process.env.BQ_DATASET || "mursyid_knowledge";
+const BQ_CORPUS_TABLE = process.env.BQ_CORPUS_TABLE || "corpus";
+const BQ_CHUNKS_TABLE = process.env.BQ_CHUNKS_TABLE || "chunks";
+const BQ_GRAPH_TABLE = process.env.BQ_GRAPH_TABLE || "graph_edges";
+const BQ_EMBEDDING_MODEL = process.env.BQ_EMBEDDING_MODEL || "text-embedding-004";
+const GCS_RAW_BUCKET = process.env.GCS_RAW_BUCKET || "";
+const KNOWLEDGE_CATALOG_ENTRY_GROUP = process.env.KNOWLEDGE_CATALOG_ENTRY_GROUP || "mursyid-knowledge";
+const KNOWLEDGE_CATALOG_ENTRY_TYPE = process.env.KNOWLEDGE_CATALOG_ENTRY_TYPE || "mursyid-knowledge-entry";
+const KNOWLEDGE_CATALOG_ASPECT_TYPE = process.env.KNOWLEDGE_CATALOG_ASPECT_TYPE || "mursyid-context";
+const MDCODE_EXPORT_DIR = process.env.MDCODE_EXPORT_DIR || path.join(process.cwd(), "catalog-export");
 
 const app = express();
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT || "3000", 10);
 
 app.use(express.json());
 
@@ -72,13 +95,185 @@ const INITIAL_LINKS = [
   { source: "al_kafi", target: "hukum", relation: "MEMBERI_PANDUAN" }
 ];
 
-// In-memory fallback graph store (used if PostgreSQL is unavailable)
+// In-memory fallback graph store for local/offline development.
 let fallbackNodes = JSON.parse(JSON.stringify(INITIAL_NODES));
 let fallbackLinks = JSON.parse(JSON.stringify(INITIAL_LINKS));
 
 // Global background crawler state
 let isBatchCrawling = false;
-let batchCrawlLogs: Array<{ url: string; title: string; status: string; log: string; time: string }> = [];
+type CrawlLogStatus = "RUNNING" | "SUCCESS" | "FAILED";
+type CrawlSource = {
+  id: number;
+  name: string;
+  url: string;
+  category: "website - internal" | "articles - internal" | "website";
+  includePatterns: string[];
+  defaultMaxPages: number;
+};
+type CrawledDocument = {
+  url: string;
+  title: string;
+  content: string;
+  sourceName?: string;
+  category?: string;
+  crawler: string;
+  depth?: number;
+};
+type KnowledgeNode = {
+  id: string;
+  type: string;
+  label: string;
+  description: string;
+};
+type KnowledgeLink = {
+  source: string;
+  target: string;
+  relation: string;
+};
+type GraphExtraction = {
+  nodes: KnowledgeNode[];
+  links: KnowledgeLink[];
+};
+type Citation = {
+  title: string;
+  url: string;
+  source: "bigquery-vector" | "knowledge-catalog-graph" | "local-memory";
+  documentId?: string;
+  chunkIndex?: number;
+  snippet?: string;
+};
+type RetrievedChunk = {
+  content: string;
+  title: string;
+  sourceUrl: string;
+  documentId: string;
+  chunkId: string;
+  chunkIndex: number;
+  metadataJson?: string;
+  score?: number;
+};
+type RetrievedGraphTriple = {
+  text: string;
+  title: string;
+  sourceUrl: string;
+  documentId?: string;
+};
+type GcpPipelineStatus = "SUCCESS" | "PARTIAL" | "FAILED" | "SKIPPED_NOT_CONFIGURED";
+type IngestStats = {
+  title: string;
+  chunksCount: number;
+  nodesCount: number;
+  linksCount: number;
+  documentsCount: number;
+  crawler: string;
+  gcsStatus: GcpPipelineStatus;
+  bigQueryStatus: GcpPipelineStatus;
+  knowledgeCatalogStatus: GcpPipelineStatus;
+  metadataCatalogPath?: string;
+  gcsRawUris: string[];
+};
+type CrawlLog = {
+  sourceId?: number;
+  sourceName?: string;
+  url: string;
+  title: string;
+  status: CrawlLogStatus;
+  log: string;
+  time: string;
+  pagesCount?: number;
+  chunksCount?: number;
+  nodesCount?: number;
+  linksCount?: number;
+  crawler?: string;
+  gcsStatus?: GcpPipelineStatus;
+  bigQueryStatus?: GcpPipelineStatus;
+  knowledgeCatalogStatus?: GcpPipelineStatus;
+};
+
+let batchCrawlLogs: CrawlLog[] = [];
+
+const SOURCE_PORTALS: CrawlSource[] = [
+  {
+    id: 1,
+    name: "Waktu Solat Digital",
+    url: "https://www.waktusolat.digital",
+    category: "website - internal",
+    includePatterns: ["*waktusolat.digital*"],
+    defaultMaxPages: 2
+  },
+  {
+    id: 2,
+    name: "Berita Harian - Agama",
+    url: "https://www.bharian.com.my/rencana/agama",
+    category: "articles - internal",
+    includePatterns: ["*bharian.com.my/rencana/agama*", "*bharian.com.my/berita/nasional*", "*bharian.com.my/rencana*"],
+    defaultMaxPages: 4
+  },
+  {
+    id: 3,
+    name: "Harian Metro - Addin",
+    url: "https://www.hmetro.com.my/addin",
+    category: "articles - internal",
+    includePatterns: ["*hmetro.com.my/addin*"],
+    defaultMaxPages: 4
+  },
+  {
+    id: 4,
+    name: "Portal i-Fiqh JAKIM",
+    url: "https://i-fiqh.islam.gov.my/portal/",
+    category: "website",
+    includePatterns: ["*i-fiqh.islam.gov.my/portal*"],
+    defaultMaxPages: 3
+  },
+  {
+    id: 5,
+    name: "Sistem MyHadith JAKIM",
+    url: "https://myhadith.islam.gov.my",
+    category: "website",
+    includePatterns: ["*myhadith.islam.gov.my*"],
+    defaultMaxPages: 3
+  },
+  {
+    id: 6,
+    name: "e-Khutbah JAKIM",
+    url: "https://www.islam.gov.my/ms/e-khutbah",
+    category: "website",
+    includePatterns: ["*islam.gov.my/ms/e-khutbah*", "*islam.gov.my/ms/khutbah*"],
+    defaultMaxPages: 3
+  },
+  {
+    id: 7,
+    name: "Mufti WP - Bayan Linnas",
+    url: "https://muftiwp.gov.my/ms/artikel/bayan-linnas",
+    category: "website",
+    includePatterns: ["*muftiwp.gov.my/ms/artikel/bayan-linnas*"],
+    defaultMaxPages: 4
+  },
+  {
+    id: 8,
+    name: "Mufti WP - Irsyad Hukum",
+    url: "https://muftiwp.gov.my/ms/artikel/irsyad-hukum",
+    category: "website",
+    includePatterns: ["*muftiwp.gov.my/ms/artikel/irsyad-hukum*"],
+    defaultMaxPages: 4
+  },
+  {
+    id: 9,
+    name: "Mufti WP - Irsyad Al-Hadith",
+    url: "https://muftiwp.gov.my/ms/artikel/irsyad-al-hadith",
+    category: "website",
+    includePatterns: ["*muftiwp.gov.my/ms/artikel/irsyad-al-hadith*"],
+    defaultMaxPages: 4
+  },
+  {
+    id: 10,
+    name: "Mufti WP - Al-Kafi li al-Fatawi",
+    url: "https://muftiwp.gov.my/ms/artikel/al-kafi-li-al-fatawi",
+    category: "website",
+    includePatterns: ["*muftiwp.gov.my/ms/artikel/al-kafi-li-al-fatawi*"],
+    defaultMaxPages: 4
+  }
+];
 
 // ==========================================
 // WORKING HOURS CONTROL MIDDLEWARE
@@ -118,26 +313,31 @@ app.use("/api", (req, res, next) => {
 });
 
 // ==========================================
-// DYNAMIC CLIENT-SIDE API KEY RESOLUTION
+// GOOGLE GEN AI SDK CLIENT VIA ADC / CLOUD RUN SERVICE ACCOUNT
 // ==========================================
-function getRequestApiKey(req: express.Request): string | undefined {
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    const token = authHeader.substring(7).trim();
-    if (token && !token.includes("MY_GEMINI_API_KEY") && token !== "") {
-      return token;
-    }
-  }
-  return undefined;
+function isAdcConfigured(): boolean {
+  return (
+    process.env.GOOGLE_GENAI_USE_ENTERPRISE === "true" || 
+    process.env.GOOGLE_GENAI_USE_VERTEXAI === "true" ||
+    !!process.env.GOOGLE_CLOUD_PROJECT
+  );
 }
 
-function getGeminiClient(reqApiKey?: string): GoogleGenAI {
-  const key = reqApiKey || process.env.GEMINI_API_KEY;
-  if (!key || key.includes("MY_GEMINI_API_KEY") || key === "") {
-    throw new Error("GEMINI_API_KEY is not configured. Sila pasangkan API Key anda di bahagian penjuru kanan atas laman web ini.");
-  }
+function getGeminiClient(): GoogleGenAI {
+  // Prevent accidental Developer API-key auth. Gemini calls should use ADC locally
+  // and the Cloud Run runtime service account in production.
+  delete process.env.GEMINI_API_KEY;
+  delete process.env.GOOGLE_API_KEY;
+  delete process.env.API_KEY;
+
+  const project = process.env.GOOGLE_CLOUD_PROJECT || GCP_PROJECT_ID || undefined;
+  console.log(`Initializing GoogleGenAI with ADC / Vertex AI for project: ${project || "default/ADC"}, location: ${GEMINI_LOCATION}`);
+
   return new GoogleGenAI({
-    apiKey: key,
+    enterprise: true,
+    vertexai: true,
+    project,
+    location: GEMINI_LOCATION,
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -147,307 +347,966 @@ function getGeminiClient(reqApiKey?: string): GoogleGenAI {
 }
 
 // ==========================================
-// DATABASE LAYER: POSTGRESQL + APACHE AGE + PGVECTOR
+// GCP-NATIVE KNOWLEDGE PLATFORM: GCS + BIGQUERY + KNOWLEDGE CATALOG
 // ==========================================
-let pgPool: pg.Pool | null = null;
-let dbInitialized = false;
-let isDbActive = false;
+let bigQueryClient: BigQuery | null = null;
+let storageClient: Storage | null = null;
+let googleAuth: GoogleAuth | null = null;
+let bigQueryInitPromise: Promise<boolean> | null = null;
 
-function getPGPool(): pg.Pool | null {
-  if (!process.env.DB_HOST) {
-    return null; // DB_HOST is omitted, load in-memory fallback gracefully
+type PreparedChunk = {
+  chunkId: string;
+  documentId: string;
+  chunkIndex: number;
+  content: string;
+  embedding: number[];
+  metadata: Record<string, any>;
+};
+
+function isGcpNativeConfigured(): boolean {
+  return Boolean(GCP_PROJECT_ID);
+}
+
+function isValidBqIdentifier(value: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
+}
+
+function assertBqIdentifiers() {
+  const identifiers = {
+    BQ_DATASET,
+    BQ_CORPUS_TABLE,
+    BQ_CHUNKS_TABLE,
+    BQ_GRAPH_TABLE,
+  };
+
+  for (const [name, value] of Object.entries(identifiers)) {
+    if (!isValidBqIdentifier(value)) {
+      throw new Error(`${name} must contain only letters, numbers, and underscores, and cannot start with a number.`);
+    }
   }
-  if (!pgPool) {
-    pgPool = new pg.Pool({
-      host: process.env.DB_HOST,
-      user: process.env.DB_USER || "postgres",
-      password: process.env.DB_PASSWORD || process.env.DB_PASS || "postgres",
-      database: process.env.DB_NAME || "postgres",
-      port: parseInt(process.env.DB_PORT || "5432", 10),
-      connectionTimeoutMillis: 4000, // Quick timeout to failover fast to memory mode
+}
+
+function bqDatasetRef(): string {
+  assertBqIdentifiers();
+  return `\`${GCP_PROJECT_ID}.${BQ_DATASET}\``;
+}
+
+function bqTableRef(table: string): string {
+  assertBqIdentifiers();
+  if (!isValidBqIdentifier(table)) {
+    throw new Error(`Invalid BigQuery table identifier: ${table}`);
+  }
+  return `\`${GCP_PROJECT_ID}.${BQ_DATASET}.${table}\``;
+}
+
+function getBigQueryClient(): BigQuery | null {
+  if (!isGcpNativeConfigured()) return null;
+  if (!bigQueryClient) {
+    bigQueryClient = new BigQuery({ projectId: GCP_PROJECT_ID });
+  }
+  return bigQueryClient;
+}
+
+function getStorageClient(): Storage | null {
+  if (!isGcpNativeConfigured() || !GCS_RAW_BUCKET) return null;
+  if (!storageClient) {
+    storageClient = new Storage({ projectId: GCP_PROJECT_ID });
+  }
+  return storageClient;
+}
+
+function getGoogleAuth(): GoogleAuth | null {
+  if (!isGcpNativeConfigured()) return null;
+  if (!googleAuth) {
+    googleAuth = new GoogleAuth({
+      projectId: GCP_PROJECT_ID,
+      scopes: ["https://www.googleapis.com/auth/cloud-platform"],
     });
   }
-  return pgPool;
+  return googleAuth;
 }
 
-async function initializeDatabase(pool: pg.Pool): Promise<boolean> {
-  if (dbInitialized) return isDbActive;
+function hashId(input: string, length: number = 16): string {
+  return createHash("sha256").update(input).digest("hex").slice(0, length);
+}
 
-  let client: pg.PoolClient | null = null;
+function slugify(input: string, fallback: string = "item"): string {
+  const slug = input
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  return slug || fallback;
+}
+
+function documentIdFor(document: CrawledDocument): string {
+  return `${slugify(document.title || document.sourceName || "document")}-${hashId(document.url || document.content)}`;
+}
+
+function safeJson(value: any): string {
   try {
-    console.log("Database: Initiating connection to", process.env.DB_HOST);
-    client = await pool.connect();
+    return JSON.stringify(value ?? {});
+  } catch {
+    return "{}";
+  }
+}
 
-    // 1. Setup Extensions
+function truncateText(value: string, maxLength: number): string {
+  if (!value) return "";
+  if (value.length <= maxLength) return value;
+  if (maxLength <= 3) return value.slice(0, maxLength);
+  return `${value.slice(0, maxLength - 3)}...`;
+}
+
+function catalogFqn(kind: string, id: string): string {
+  const project = slugify(GCP_PROJECT_ID || "project", "project");
+  const location = slugify(GCP_LOCATION || "location", "location");
+  const group = slugify(KNOWLEDGE_CATALOG_ENTRY_GROUP, "entry-group");
+  return `custom:mursyid-ai.${project}.${location}.${group}.${slugify(kind)}.${slugify(id)}`;
+}
+
+function getEmbeddingModelName(): string {
+  if (BQ_EMBEDDING_MODEL.includes(".") || BQ_EMBEDDING_MODEL.includes("/")) {
+    return "text-embedding-004";
+  }
+  return BQ_EMBEDDING_MODEL || "text-embedding-004";
+}
+
+async function generateTextEmbedding(ai: GoogleGenAI, content: string): Promise<number[]> {
+  const embedResponse = await ai.models.embedContent({
+    model: getEmbeddingModelName(),
+    contents: content,
+  });
+  return embedResponse.embeddings?.[0]?.values || [];
+}
+
+async function runBigQuery(query: string, params?: Record<string, any>): Promise<any[]> {
+  const client = getBigQueryClient();
+  if (!client) return [];
+  const [rows] = await client.query({
+    query,
+    params,
+    location: GCP_LOCATION,
+  });
+  return rows as any[];
+}
+
+async function ensureBigQueryKnowledgeStore(): Promise<boolean> {
+  if (!isGcpNativeConfigured()) return false;
+  if (!bigQueryInitPromise) {
+    bigQueryInitPromise = (async () => {
+      const location = GCP_LOCATION.replace(/'/g, "");
+      await runBigQuery(`CREATE SCHEMA IF NOT EXISTS ${bqDatasetRef()} OPTIONS(location='${location}')`);
+      await runBigQuery(`
+        CREATE TABLE IF NOT EXISTS ${bqTableRef(BQ_CORPUS_TABLE)} (
+          document_id STRING NOT NULL,
+          source_url STRING,
+          title STRING,
+          source_name STRING,
+          category STRING,
+          crawler STRING,
+          gcs_uri STRING,
+          content STRING,
+          metadata_json STRING,
+          created_at TIMESTAMP,
+          updated_at TIMESTAMP
+        )
+      `);
+      await runBigQuery(`
+        CREATE TABLE IF NOT EXISTS ${bqTableRef(BQ_CHUNKS_TABLE)} (
+          chunk_id STRING NOT NULL,
+          document_id STRING NOT NULL,
+          source_url STRING,
+          title STRING,
+          chunk_index INT64,
+          content STRING,
+          embedding ARRAY<FLOAT64>,
+          metadata_json STRING,
+          created_at TIMESTAMP
+        )
+      `);
+      await runBigQuery(`
+        CREATE TABLE IF NOT EXISTS ${bqTableRef(BQ_GRAPH_TABLE)} (
+          edge_id STRING NOT NULL,
+          document_id STRING,
+          source_url STRING,
+          source_id STRING,
+          source_label STRING,
+          source_type STRING,
+          source_description STRING,
+          target_id STRING,
+          target_label STRING,
+          target_type STRING,
+          target_description STRING,
+          relation STRING,
+          metadata_json STRING,
+          created_at TIMESTAMP
+        )
+      `);
+
+      try {
+        await runBigQuery(`
+          CREATE VECTOR INDEX IF NOT EXISTS chunks_embedding_idx
+          ON ${bqTableRef(BQ_CHUNKS_TABLE)}(embedding)
+          OPTIONS(index_type='TREE_AH', distance_type='COSINE')
+        `);
+      } catch (err: any) {
+        console.warn("BigQuery Vector Index: continuing without index:", err.message);
+      }
+
+      return true;
+    })().catch(err => {
+      bigQueryInitPromise = null;
+      throw err;
+    });
+  }
+  return bigQueryInitPromise;
+}
+
+async function uploadRawMarkdownToGCS(document: CrawledDocument, documentId: string): Promise<{ status: GcpPipelineStatus; uri?: string }> {
+  const client = getStorageClient();
+  if (!client) return { status: "SKIPPED_NOT_CONFIGURED" };
+
+  try {
+    const sourceSlug = slugify(document.sourceName || document.category || "manual");
+    const objectName = `raw/${sourceSlug}/${documentId}.md`;
+    const file = client.bucket(GCS_RAW_BUCKET).file(objectName);
+    await file.save(document.content, {
+      contentType: "text/markdown; charset=utf-8",
+      metadata: {
+        metadata: {
+          title: document.title,
+          sourceUrl: document.url,
+          sourceName: document.sourceName || "",
+          crawler: document.crawler,
+        },
+      },
+    });
+    return { status: "SUCCESS", uri: `gs://${GCS_RAW_BUCKET}/${objectName}` };
+  } catch (err: any) {
+    console.error("Cloud Storage snapshot failed:", err.message);
+    return { status: "FAILED" };
+  }
+}
+
+function buildGraphRows(document: CrawledDocument, documentId: string, graphData: GraphExtraction): any[] {
+  const nodesById = new Map<string, KnowledgeNode>();
+  for (const node of graphData.nodes || []) {
+    nodesById.set(String(node.id).toLowerCase(), node);
+  }
+
+  return (graphData.links || []).map(link => {
+    const sourceNode = nodesById.get(String(link.source).toLowerCase());
+    const targetNode = nodesById.get(String(link.target).toLowerCase());
+    const edgeKey = `${documentId}:${link.source}:${link.relation}:${link.target}`;
+    return {
+      edge_id: hashId(edgeKey, 24),
+      document_id: documentId,
+      source_url: document.url,
+      source_id: link.source,
+      source_label: sourceNode?.label || link.source,
+      source_type: sourceNode?.type || "Entity",
+      source_description: sourceNode?.description || "",
+      target_id: link.target,
+      target_label: targetNode?.label || link.target,
+      target_type: targetNode?.type || "Entity",
+      target_description: targetNode?.description || "",
+      relation: link.relation,
+      metadata_json: safeJson({
+        title: document.title,
+        sourceName: document.sourceName,
+        category: document.category,
+      }),
+      created_at: new Date().toISOString(),
+    };
+  });
+}
+
+async function writeRowsToBigQuery(document: CrawledDocument, documentId: string, chunks: PreparedChunk[], graphData: GraphExtraction, gcsUri?: string): Promise<GcpPipelineStatus> {
+  if (!isGcpNativeConfigured()) return "SKIPPED_NOT_CONFIGURED";
+
+  try {
+    await ensureBigQueryKnowledgeStore();
+    const client = getBigQueryClient();
+    if (!client) return "SKIPPED_NOT_CONFIGURED";
+
+    const now = new Date().toISOString();
+    // BigQuery streaming inserts cannot be immediately updated/deleted. Keep ingestion
+    // append-only here; query paths de-duplicate by IDs where strict uniqueness matters.
+    await client.dataset(BQ_DATASET).table(BQ_CORPUS_TABLE).insert([{
+      document_id: documentId,
+      source_url: document.url,
+      title: document.title,
+      source_name: document.sourceName || "",
+      category: document.category || "",
+      crawler: document.crawler,
+      gcs_uri: gcsUri || "",
+      content: document.content,
+      metadata_json: safeJson({
+        depth: document.depth,
+        embeddingModel: BQ_EMBEDDING_MODEL,
+      }),
+      created_at: now,
+      updated_at: now,
+    }], { ignoreUnknownValues: true } as any);
+
+    const chunkRows = chunks.map(chunk => ({
+      chunk_id: chunk.chunkId,
+      document_id: documentId,
+      source_url: document.url,
+      title: document.title,
+      chunk_index: chunk.chunkIndex,
+      content: chunk.content,
+      embedding: chunk.embedding,
+      metadata_json: safeJson(chunk.metadata),
+      created_at: now,
+    }));
+    if (chunkRows.length > 0) {
+      await client.dataset(BQ_DATASET).table(BQ_CHUNKS_TABLE).insert(chunkRows, { ignoreUnknownValues: true } as any);
+    }
+
+    const graphRows = buildGraphRows(document, documentId, graphData);
+    if (graphRows.length > 0) {
+      await client.dataset(BQ_DATASET).table(BQ_GRAPH_TABLE).insert(graphRows, { ignoreUnknownValues: true } as any);
+    }
+
+    return "SUCCESS";
+  } catch (err: any) {
+    console.error("BigQuery knowledge write failed:", err.message);
+    return "FAILED";
+  }
+}
+
+function yamlString(value: string): string {
+  return `"${String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+async function exportMetadataAsCode(document: CrawledDocument, documentId: string, graphData: GraphExtraction, gcsUri?: string): Promise<{ status: GcpPipelineStatus; path?: string }> {
+  try {
+    const entriesDir = path.join(MDCODE_EXPORT_DIR, "entries");
+    await fs.promises.mkdir(entriesDir, { recursive: true });
+
+    const entryPath = path.join(entriesDir, `${documentId}.md`);
+    const frontmatter = [
+      "---",
+      `id: ${yamlString(documentId)}`,
+      `type: ${yamlString("mursyid-knowledge-entry")}`,
+      `title: ${yamlString(document.title)}`,
+      `source_url: ${yamlString(document.url)}`,
+      `source_name: ${yamlString(document.sourceName || "")}`,
+      `category: ${yamlString(document.category || "")}`,
+      `gcs_uri: ${yamlString(gcsUri || "")}`,
+      `nodes_count: ${graphData.nodes?.length || 0}`,
+      `links_count: ${graphData.links?.length || 0}`,
+      "---",
+      "",
+      `# ${document.title}`,
+      "",
+      `Source: ${document.url}`,
+      "",
+      "## Extracted Graph",
+      "",
+      ...(graphData.links || []).slice(0, 50).map(link => `- ${link.source} --${link.relation}--> ${link.target}`),
+      "",
+      "## Content",
+      "",
+      document.content,
+      "",
+    ].join("\n");
+
+    await fs.promises.writeFile(entryPath, frontmatter, "utf8");
+
+    const files = (await fs.promises.readdir(entriesDir))
+      .filter(file => file.endsWith(".md"))
+      .sort();
+    const catalogYaml = [
+      "# Metadata-as-code export inspired by Google Knowledge Catalog mdcode demos.",
+      "catalog:",
+      `  project: ${yamlString(GCP_PROJECT_ID || "local")}`,
+      `  location: ${yamlString(GCP_LOCATION)}`,
+      `  entry_group: ${yamlString(KNOWLEDGE_CATALOG_ENTRY_GROUP)}`,
+      "entries:",
+      ...files.map(file => `  - path: ${yamlString(`entries/${file}`)}`),
+      "",
+    ].join("\n");
+
+    const catalogPath = path.join(MDCODE_EXPORT_DIR, "catalog.yaml");
+    await fs.promises.writeFile(catalogPath, catalogYaml, "utf8");
+    return { status: "SUCCESS", path: catalogPath };
+  } catch (err: any) {
+    console.error("Metadata-as-code export failed:", err.message);
+    return { status: "FAILED" };
+  }
+}
+
+async function dataplexRequest(method: string, resourcePath: string, body?: any): Promise<any> {
+  const auth = getGoogleAuth();
+  if (!auth) throw new Error("Google Cloud project is not configured.");
+
+  const url = `https://dataplex.googleapis.com/v1/${resourcePath}`;
+  const authClient = await auth.getClient();
+  const authHeaders = await authClient.getRequestHeaders(url);
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+
+  if (typeof (authHeaders as Headers).forEach === "function") {
+    (authHeaders as Headers).forEach((value, key) => {
+      headers[key] = value;
+    });
+  } else {
+    for (const [key, value] of Object.entries(authHeaders as Record<string, any>)) {
+      headers[key] = String(value);
+    }
+  }
+
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+
+  const text = await response.text();
+  let payload: any = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { raw: text };
+  }
+
+  if (!response.ok) {
+    const message = payload.error?.message || payload.message || response.statusText;
+    const error: any = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
+
+  return payload;
+}
+
+async function ensureKnowledgeCatalogScaffold(): Promise<void> {
+  const parent = `projects/${GCP_PROJECT_ID}/locations/${GCP_LOCATION}`;
+
+  try {
+    await dataplexRequest("GET", `${parent}/aspectTypes/${KNOWLEDGE_CATALOG_ASPECT_TYPE}`);
+  } catch (err: any) {
+    if (err.status !== 404) throw err;
+    await dataplexRequest("POST", `${parent}/aspectTypes?aspectTypeId=${encodeURIComponent(KNOWLEDGE_CATALOG_ASPECT_TYPE)}`, {
+      displayName: "Mursyid Context",
+      description: "Mursyid AI crawled source, fiqh graph, and grounding metadata.",
+      metadataTemplate: {
+        name: "mursyid_context",
+        type: "record",
+        recordFields: [
+          { name: "title", index: 1, type: "string" },
+          { name: "source_url", index: 2, type: "string" },
+          { name: "gcs_uri", index: 3, type: "string" },
+          { name: "nodes_count", index: 4, type: "int" },
+          { name: "links_count", index: 5, type: "int" },
+        ],
+      },
+    });
+  }
+
+  try {
+    await dataplexRequest("GET", `${parent}/entryTypes/${KNOWLEDGE_CATALOG_ENTRY_TYPE}`);
+  } catch (err: any) {
+    if (err.status !== 404) throw err;
+    await dataplexRequest("POST", `${parent}/entryTypes?entryTypeId=${encodeURIComponent(KNOWLEDGE_CATALOG_ENTRY_TYPE)}`, {
+      displayName: "Mursyid Knowledge Entry",
+      description: "Crawled Islamic jurisprudence source or extracted fiqh concept.",
+      typeAliases: ["RESOURCE", "NODE"],
+      platform: "mursyid-ai",
+      system: "mursyid-ai",
+      requiredAspects: [
+        { type: `${parent}/aspectTypes/${KNOWLEDGE_CATALOG_ASPECT_TYPE}` },
+      ],
+    });
+  }
+
+  try {
+    await dataplexRequest("GET", `${parent}/entryGroups/${KNOWLEDGE_CATALOG_ENTRY_GROUP}`);
+  } catch (err: any) {
+    if (err.status !== 404) throw err;
+    await dataplexRequest("POST", `${parent}/entryGroups?entryGroupId=${encodeURIComponent(KNOWLEDGE_CATALOG_ENTRY_GROUP)}`, {
+      displayName: "Mursyid Knowledge",
+      description: "Governed context entries for Mursyid AI.",
+    });
+  }
+}
+
+async function createOrPatchCatalogEntry(entryId: string, body: any): Promise<void> {
+  const entryGroupPath = `projects/${GCP_PROJECT_ID}/locations/${GCP_LOCATION}/entryGroups/${KNOWLEDGE_CATALOG_ENTRY_GROUP}`;
+  try {
+    await dataplexRequest("POST", `${entryGroupPath}/entries?entryId=${encodeURIComponent(entryId)}`, body);
+  } catch (err: any) {
+    if (err.status !== 409) throw err;
+    await dataplexRequest("PATCH", `${entryGroupPath}/entries/${encodeURIComponent(entryId)}?updateMask=entrySource,aspects`, body);
+  }
+}
+
+async function publishToKnowledgeCatalog(document: CrawledDocument, documentId: string, graphData: GraphExtraction, gcsUri?: string): Promise<GcpPipelineStatus> {
+  if (!isGcpNativeConfigured()) return "SKIPPED_NOT_CONFIGURED";
+
+  try {
+    await ensureKnowledgeCatalogScaffold();
+    const parent = `projects/${GCP_PROJECT_ID}/locations/${GCP_LOCATION}`;
+    const aspectKey = `${GCP_PROJECT_ID}.${GCP_LOCATION}.${KNOWLEDGE_CATALOG_ASPECT_TYPE}`;
+    const entryType = `${parent}/entryTypes/${KNOWLEDGE_CATALOG_ENTRY_TYPE}`;
+    const entryId = `source-${documentId}`.slice(0, 250);
+    const aspectData = {
+      title: document.title,
+      source_url: document.url,
+      gcs_uri: gcsUri || "",
+      nodes_count: graphData.nodes?.length || 0,
+      links_count: graphData.links?.length || 0,
+    };
+
+    await createOrPatchCatalogEntry(entryId, {
+      entryType,
+      fullyQualifiedName: catalogFqn("sources", documentId),
+      entrySource: {
+        resource: document.url,
+        system: "mursyid-ai",
+        platform: "web",
+        displayName: truncateText(document.title, 500),
+        description: truncateText(document.content, 2000),
+        labels: {
+          crawler: slugify(document.crawler, "crawler"),
+          source: slugify(document.sourceName || "manual", "source"),
+        },
+        updateTime: new Date().toISOString(),
+      },
+      aspects: {
+        [aspectKey]: {
+          data: aspectData,
+        },
+      },
+    });
+
+    for (const node of (graphData.nodes || []).slice(0, 25)) {
+      const nodeEntryId = `concept-${slugify(node.id, "entity")}`.slice(0, 250);
+      await createOrPatchCatalogEntry(nodeEntryId, {
+        entryType,
+        fullyQualifiedName: catalogFqn("concepts", node.id),
+        entrySource: {
+          resource: `mursyid://concepts/${node.id}`,
+          system: "mursyid-ai",
+          platform: "knowledge-graph",
+          displayName: truncateText(node.label || node.id, 500),
+          description: truncateText(node.description || "", 2000),
+          labels: {
+            node_type: slugify(node.type || "entity", "entity"),
+          },
+          updateTime: new Date().toISOString(),
+        },
+        aspects: {
+          [aspectKey]: {
+            data: {
+              title: node.label || node.id,
+              source_url: document.url,
+              gcs_uri: gcsUri || "",
+              nodes_count: 1,
+              links_count: (graphData.links || []).filter(link => link.source === node.id || link.target === node.id).length,
+            },
+          },
+        },
+      });
+    }
+
+    return "SUCCESS";
+  } catch (err: any) {
+    console.error("Knowledge Catalog publish failed:", err.message);
+    return "FAILED";
+  }
+}
+
+async function persistGcpNativeKnowledge(document: CrawledDocument, chunks: PreparedChunk[], graphData: GraphExtraction): Promise<{
+  gcsStatus: GcpPipelineStatus;
+  bigQueryStatus: GcpPipelineStatus;
+  knowledgeCatalogStatus: GcpPipelineStatus;
+  metadataCatalogPath?: string;
+  gcsRawUri?: string;
+}> {
+  const documentId = chunks[0]?.documentId || documentIdFor(document);
+  const gcsResult = await uploadRawMarkdownToGCS(document, documentId);
+  const metadataResult = await exportMetadataAsCode(document, documentId, graphData, gcsResult.uri);
+  const bigQueryStatus = await writeRowsToBigQuery(document, documentId, chunks, graphData, gcsResult.uri);
+  const knowledgeCatalogStatus = await publishToKnowledgeCatalog(document, documentId, graphData, gcsResult.uri);
+
+  return {
+    gcsStatus: gcsResult.status,
+    bigQueryStatus,
+    knowledgeCatalogStatus,
+    metadataCatalogPath: metadataResult.path,
+    gcsRawUri: gcsResult.uri,
+  };
+}
+
+function summarizePipelineStatus(statuses: GcpPipelineStatus[]): GcpPipelineStatus {
+  const actionable = statuses.filter(status => status !== "SKIPPED_NOT_CONFIGURED");
+  if (actionable.length === 0) return "SKIPPED_NOT_CONFIGURED";
+  if (actionable.every(status => status === "SUCCESS")) return "SUCCESS";
+  if (actionable.some(status => status === "SUCCESS")) return "PARTIAL";
+  return "FAILED";
+}
+
+function dedupeCitations(citations: Citation[]): Citation[] {
+  const seen = new Set<string>();
+  const deduped: Citation[] = [];
+
+  for (const citation of citations) {
+    if (!citation.url) continue;
+    const key = `${citation.url}::${citation.documentId || ""}::${citation.chunkIndex ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(citation);
+  }
+
+  return deduped;
+}
+
+function chunkCitation(chunk: RetrievedChunk): Citation {
+  return {
+    title: chunk.title || chunk.sourceUrl || "BigQuery source",
+    url: chunk.sourceUrl,
+    source: "bigquery-vector",
+    documentId: chunk.documentId,
+    chunkIndex: chunk.chunkIndex,
+    snippet: truncateText(chunk.content, 240),
+  };
+}
+
+async function searchBigQueryVectorChunks(ai: GoogleGenAI, message: string, limit: number = 3): Promise<RetrievedChunk[]> {
+  if (!isGcpNativeConfigured()) return [];
+
+  try {
+    await ensureBigQueryKnowledgeStore();
+    const queryEmbedding = await generateTextEmbedding(ai, message);
+    if (queryEmbedding.length === 0) return [];
+
     try {
-      await client.query("CREATE EXTENSION IF NOT EXISTS age CASCADE;");
-      console.log("Database: Extension 'age' confirmed.");
-    } catch (e: any) {
-      console.warn("Database Warning: Could not create extension 'age':", e.message);
+      const rows = await runBigQuery(`
+        SELECT
+          base.content,
+          base.title,
+          base.source_url,
+          base.document_id,
+          base.chunk_id,
+          base.chunk_index,
+          base.metadata_json,
+          distance
+        FROM VECTOR_SEARCH(
+          TABLE ${bqTableRef(BQ_CHUNKS_TABLE)},
+          'embedding',
+          (SELECT @queryEmbedding AS embedding),
+          top_k => @limit,
+          distance_type => 'COSINE',
+          options => '{"use_brute_force": true}'
+        )
+        WHERE ARRAY_LENGTH(base.embedding) > 0
+        ORDER BY distance ASC
+      `, { queryEmbedding, limit });
+
+      return rows.map(row => ({
+        content: row.content || "",
+        title: row.title || row.source_url || "BigQuery source",
+        sourceUrl: row.source_url || "",
+        documentId: row.document_id || "",
+        chunkId: row.chunk_id || "",
+        chunkIndex: Number(row.chunk_index ?? 0),
+        metadataJson: row.metadata_json,
+        score: typeof row.distance === "number" ? row.distance : undefined,
+      }));
+    } catch (vectorErr: any) {
+      console.warn("BigQuery VECTOR_SEARCH unavailable, using exact SQL cosine fallback:", vectorErr.message);
+      const rows = await runBigQuery(`
+        WITH query_vector AS (
+          SELECT @queryEmbedding AS vector
+        )
+        SELECT
+          c.content,
+          c.title,
+          c.source_url,
+          c.document_id,
+          c.chunk_id,
+          c.chunk_index,
+          c.metadata_json,
+          (
+            SELECT SAFE_DIVIDE(
+              SUM(base_value * query_value),
+              SQRT(SUM(base_value * base_value)) * SQRT(SUM(query_value * query_value))
+            )
+            FROM UNNEST(c.embedding) AS base_value WITH OFFSET AS pos
+            JOIN UNNEST(q.vector) AS query_value WITH OFFSET AS pos2
+            ON pos = pos2
+          ) AS similarity
+        FROM ${bqTableRef(BQ_CHUNKS_TABLE)} c
+        CROSS JOIN query_vector q
+        WHERE ARRAY_LENGTH(c.embedding) > 0
+        ORDER BY similarity DESC
+        LIMIT @limit
+      `, { queryEmbedding, limit });
+
+      return rows.map(row => ({
+        content: row.content || "",
+        title: row.title || row.source_url || "BigQuery source",
+        sourceUrl: row.source_url || "",
+        documentId: row.document_id || "",
+        chunkId: row.chunk_id || "",
+        chunkIndex: Number(row.chunk_index ?? 0),
+        metadataJson: row.metadata_json,
+        score: typeof row.similarity === "number" ? row.similarity : undefined,
+      }));
     }
-
-    try {
-      await client.query("CREATE EXTENSION IF NOT EXISTS vector CASCADE;");
-      console.log("Database: Extension 'vector' confirmed.");
-    } catch (e: any) {
-      console.warn("Database Warning: Could not create extension 'vector':", e.message);
-    }
-
-    // Load age and set path
-    await client.query("LOAD 'age';");
-    await client.query('SET search_path = ag_catalog, "$user", public;');
-
-    // 2. Validate/Create Apache AGE graph 'mursyid_graph'
-    const graphCheck = await client.query(
-      "SELECT count(*) FROM ag_catalog.ag_graph WHERE name = 'mursyid_graph';"
-    );
-    const hasGraph = parseInt(graphCheck.rows[0].count, 10) > 0;
-
-    if (!hasGraph) {
-      await client.query("SELECT create_graph('mursyid_graph');");
-      console.log("Database: Created Apache AGE graph 'mursyid_graph'.");
-    } else {
-      console.log("Database: Apache AGE graph 'mursyid_graph' exists.");
-    }
-
-    // 3. Create regular tables (e.g. fatwa_chunks for pgvector search)
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS fatwa_chunks (
-        id SERIAL PRIMARY KEY,
-        content TEXT NOT NULL,
-        embedding vector(1536),
-        metadata JSONB
-      );
-    `);
-    console.log("Database: Table 'fatwa_chunks' verified.");
-
-    // 4. Pre-seed baseline if the graph is empty
-    const nodeCountResult = await client.query(`
-      SELECT count(*) FROM cypher('mursyid_graph', $$
-        MATCH (v:Entity) RETURN v
-      $$) as (v agtype);
-    `);
-    const nodeCount = parseInt(nodeCountResult.rows[0].count, 10);
-
-    if (nodeCount === 0) {
-      console.log("Database: Pre-seeding baseline Islamic Ontology...");
-      // Seed nodes
-      for (const node of INITIAL_NODES) {
-        await client.query(`
-          SELECT * FROM cypher('mursyid_graph', $$
-            MERGE (v:Entity {id: $id})
-            SET v.type = $type, v.label = $label, v.description = $description
-            RETURN v
-          $$, $1) as (v agtype);
-        `, [JSON.stringify(node)]);
-      }
-
-      // Seed links
-      for (const link of INITIAL_LINKS) {
-        await client.query(`
-          SELECT * FROM cypher('mursyid_graph', $$
-            MATCH (a:Entity {id: $source}), (b:Entity {id: $target})
-            MERGE (a)-[r:RELATION {relation: $relation}]->(b)
-            RETURN r
-          $$, $1) as (r agtype);
-        `, [JSON.stringify(link)]);
-      }
-      console.log("Database: Pre-seeding completed successfully.");
-    }
-
-    isDbActive = true;
-    dbInitialized = true;
-    return true;
   } catch (err: any) {
-    console.error("Database: Failed to initialize. Falling back to Stateless Memory mode.", err.message);
-    isDbActive = false;
-    dbInitialized = true; // Still marked initialized to prevent repeat spamming of logs
-    return false;
-  } finally {
-    if (client) {
-      client.release();
-    }
+    console.error("BigQuery vector retrieval failed:", err.message);
+    return [];
   }
 }
 
-// ==========================================
-// APACHE AGE HELPER: AGTYPE DE-SERIALIZER
-// ==========================================
-function parseAgtype(val: any): any {
-  if (val === null || val === undefined) return null;
-  if (typeof val === "object") {
-    if (val.properties) {
-      return {
-        id: val.properties.id,
-        type: val.properties.type,
-        label: val.properties.label,
-        description: val.properties.description,
-        properties: val.properties
-      };
-    }
-    return val;
-  }
+async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10): Promise<RetrievedGraphTriple[]> {
+  if (!isGcpNativeConfigured() || keywords.length === 0) return [];
 
-  if (typeof val === "string") {
-    let cleaned = val.trim();
-    // Remove type suffixes e.g., ::vertex, ::edge, ::path
-    cleaned = cleaned.replace(/::[a-zA-Z0-9_]+$/, "");
-
-    try {
-      const parsed = JSON.parse(cleaned);
-      if (parsed && typeof parsed === "object") {
-        if (parsed.properties) {
-          return {
-            id: parsed.properties.id,
-            type: parsed.properties.type,
-            label: parsed.properties.label,
-            description: parsed.properties.description,
-            properties: parsed.properties
-          };
-        }
-        return parsed;
-      }
-      return parsed;
-    } catch (e) {
-      if (cleaned.startsWith('"') && cleaned.endsWith('"')) {
-        return cleaned.substring(1, cleaned.length - 1);
-      }
-      return cleaned;
-    }
-  }
-  return val;
-}
-
-// ==========================================
-// DATABASE GRAPH ACTIONS
-// ==========================================
-async function saveNodeToGraph(pool: pg.Pool, node: { id: string; type: string; label: string; description: string }) {
-  const client = await pool.connect();
   try {
-    await client.query('LOAD \'age\'; SET search_path = ag_catalog, "$user", public;');
-    const query = `
-      SELECT * FROM cypher('mursyid_graph', $$
-        MERGE (v:Entity {id: $id})
-        SET v.type = $type, v.label = $label, v.description = $description
-        RETURN v
-      $$, $1) as (v agtype);
-    `;
-    await client.query(query, [JSON.stringify(node)]);
+    await ensureBigQueryKnowledgeStore();
+    const selectedKeywords = keywords.slice(0, 4).map(keyword => keyword.toLowerCase());
+    const rows = await runBigQuery(`
+      SELECT DISTINCT
+        source_label,
+        relation,
+        target_label,
+        source_description,
+        target_description,
+        source_url,
+        document_id,
+        JSON_VALUE(metadata_json, '$.title') AS title
+      FROM ${bqTableRef(BQ_GRAPH_TABLE)}
+      WHERE EXISTS (
+        SELECT 1
+        FROM UNNEST(@keywords) AS keyword
+        WHERE LOWER(source_id) LIKE CONCAT('%', keyword, '%')
+           OR LOWER(source_label) LIKE CONCAT('%', keyword, '%')
+           OR LOWER(target_id) LIKE CONCAT('%', keyword, '%')
+           OR LOWER(target_label) LIKE CONCAT('%', keyword, '%')
+           OR LOWER(relation) LIKE CONCAT('%', keyword, '%')
+      )
+      LIMIT @limit
+    `, { keywords: selectedKeywords, limit });
+
+    return rows.map(row => ({
+      text: `[Knowledge Catalog/BigQuery Graph] ${row.source_label} -> ${row.relation} -> ${row.target_label} (${row.source_description || ""} | ${row.target_description || ""})`,
+      title: row.title || row.source_url || "Knowledge Catalog graph source",
+      sourceUrl: row.source_url || "",
+      documentId: row.document_id || "",
+    }));
   } catch (err: any) {
-    console.error(`Database Error: Gagal menyimpan nod ${node.id}:`, err.message);
-  } finally {
-    client.release();
+    console.error("BigQuery graph retrieval failed:", err.message);
+    return [];
   }
 }
 
-async function saveLinkToGraph(pool: pg.Pool, link: { source: string; target: string; relation: string }) {
-  const client = await pool.connect();
+async function getFullGraphFromBigQuery(): Promise<{ nodes: KnowledgeNode[]; links: KnowledgeLink[] } | null> {
+  if (!isGcpNativeConfigured()) return null;
+
   try {
-    await client.query('LOAD \'age\'; SET search_path = ag_catalog, "$user", public;');
-    const query = `
-      SELECT * FROM cypher('mursyid_graph', $$
-        MATCH (a:Entity {id: $source}), (b:Entity {id: $target})
-        MERGE (a)-[r:RELATION {relation: $relation}]->(b)
-        RETURN r
-      $$, $1) as (r agtype);
-    `;
-    await client.query(query, [JSON.stringify(link)]);
-  } catch (err: any) {
-    console.error(`Database Error: Gagal menyambung ${link.source} -> ${link.target}:`, err.message);
-  } finally {
-    client.release();
-  }
-}
-
-async function getFullGraph(pool: pg.Pool) {
-  const client = await pool.connect();
-  try {
-    await client.query('LOAD \'age\'; SET search_path = ag_catalog, "$user", public;');
-
-    // 1. Fetch nodes
-    const nodesQuery = `
-      SELECT * FROM cypher('mursyid_graph', $$
-        MATCH (v:Entity)
-        RETURN v
-      $$) as (v agtype);
-    `;
-    const nodesResult = await client.query(nodesQuery);
-
-    // 2. Fetch links
-    const linksQuery = `
-      SELECT * FROM cypher('mursyid_graph', $$
-        MATCH (a:Entity)-[r:RELATION]->(b:Entity)
-        RETURN a.id, b.id, r
-      $$) as (source_id agtype, target_id agtype, r agtype);
-    `;
-    const linksResult = await client.query(linksQuery);
-
-    const nodes = nodesResult.rows.map(row => parseAgtype(row.v)).filter(Boolean);
-    const links = linksResult.rows.map(row => {
-      const source = parseAgtype(row.source_id);
-      const target = parseAgtype(row.target_id);
-      const rObj = parseAgtype(row.r);
-      return {
-        source,
-        target,
-        relation: rObj?.properties?.relation || "RELATION"
-      };
-    }).filter(link => link.source && link.target);
-
-    return { nodes, links };
-  } catch (err: any) {
-    console.error("Database Error: Gagal mendapatkan graf penuh:", err.message);
-    throw err;
-  } finally {
-    client.release();
-  }
-}
-
-async function resetGraphInDB(pool: pg.Pool) {
-  const client = await pool.connect();
-  try {
-    await client.query('LOAD \'age\'; SET search_path = ag_catalog, "$user", public;');
-
-    // Drop all nodes and relations
-    await client.query(`
-      SELECT * FROM cypher('mursyid_graph', $$
-        MATCH (n:Entity)
-        DETACH DELETE n
-      $$) as (v agtype);
+    await ensureBigQueryKnowledgeStore();
+    const rows = await runBigQuery(`
+      SELECT
+        source_id,
+        source_label,
+        source_type,
+        source_description,
+        target_id,
+        target_label,
+        target_type,
+        target_description,
+        relation
+      FROM ${bqTableRef(BQ_GRAPH_TABLE)}
+      LIMIT 1000
     `);
 
-    // Reseed baseline
-    for (const node of INITIAL_NODES) {
-      await client.query(`
-        SELECT * FROM cypher('mursyid_graph', $$
-          MERGE (v:Entity {id: $id})
-          SET v.type = $type, v.label = $label, v.description = $description
-          RETURN v
-        $$, $1) as (v agtype);
-      `, [JSON.stringify(node)]);
+    if (rows.length === 0) return null;
+
+    const nodeMap = new Map<string, KnowledgeNode>();
+    const links: KnowledgeLink[] = [];
+    const linkKeys = new Set<string>();
+    for (const row of rows) {
+      if (row.source_id && !nodeMap.has(row.source_id)) {
+        nodeMap.set(row.source_id, {
+          id: row.source_id,
+          type: row.source_type || "Entity",
+          label: row.source_label || row.source_id,
+          description: row.source_description || "",
+        });
+      }
+      if (row.target_id && !nodeMap.has(row.target_id)) {
+        nodeMap.set(row.target_id, {
+          id: row.target_id,
+          type: row.target_type || "Entity",
+          label: row.target_label || row.target_id,
+          description: row.target_description || "",
+        });
+      }
+      if (row.source_id && row.target_id) {
+        const relation = row.relation || "RELATION";
+        const linkKey = `${row.source_id}::${relation}::${row.target_id}`;
+        if (linkKeys.has(linkKey)) continue;
+        linkKeys.add(linkKey);
+        links.push({
+          source: row.source_id,
+          target: row.target_id,
+          relation,
+        });
+      }
     }
 
-    for (const link of INITIAL_LINKS) {
-      await client.query(`
-        SELECT * FROM cypher('mursyid_graph', $$
-          MATCH (a:Entity {id: $source}), (b:Entity {id: $target})
-          MERGE (a)-[r:RELATION {relation: $relation}]->(b)
-          RETURN r
-        $$, $1) as (r agtype);
-      `, [JSON.stringify(link)]);
-    }
+    return { nodes: Array.from(nodeMap.values()), links };
   } catch (err: any) {
-    console.error("Database Error: Gagal menetapkan semula graf dalam DB:", err.message);
-    throw err;
-  } finally {
-    client.release();
+    console.error("BigQuery graph fetch failed:", err.message);
+    return null;
+  }
+}
+
+async function resetBigQueryGraph(): Promise<{ nodes: KnowledgeNode[]; links: KnowledgeLink[] } | null> {
+  if (!isGcpNativeConfigured()) return null;
+
+  try {
+    await ensureBigQueryKnowledgeStore();
+    await runBigQuery(`DELETE FROM ${bqTableRef(BQ_GRAPH_TABLE)} WHERE TRUE`);
+    const baselineDocument: CrawledDocument = {
+      url: "mursyid://baseline",
+      title: "Pristine Islamic Ontology Baseline",
+      content: "Baseline ontology seeded by Mursyid AI.",
+      crawler: "baseline",
+      sourceName: "Mursyid AI",
+      category: "website",
+    };
+    const baselineGraph: GraphExtraction = {
+      nodes: INITIAL_NODES as KnowledgeNode[],
+      links: INITIAL_LINKS as KnowledgeLink[],
+    };
+    await writeRowsToBigQuery(baselineDocument, "baseline", [], baselineGraph, undefined);
+    return { nodes: INITIAL_NODES as KnowledgeNode[], links: INITIAL_LINKS as KnowledgeLink[] };
+  } catch (err: any) {
+    console.error("BigQuery graph reset failed:", err.message);
+    return null;
   }
 }
 
 // ==========================================
 // CRAWLER & VECTOR HELPERS
 // ==========================================
-async function extractCleanContent(url: string, ai: GoogleGenAI): Promise<{ title: string; content: string }> {
+function getSourceMaxPages(source?: CrawlSource, override?: number): number {
+  if (override && Number.isFinite(override)) {
+    return Math.max(1, override);
+  }
+
+  const sourceDefault = source?.defaultMaxPages || CRAWL_MAX_PAGES_PER_SOURCE;
+  return Math.max(1, Math.min(sourceDefault, CRAWL_MAX_PAGES_PER_SOURCE));
+}
+
+function getCrawlTimeString(): string {
+  return new Date().toLocaleTimeString("en-US", { timeZone: "Asia/Kuala_Lumpur" });
+}
+
+async function runCrawl4AiBridge(source: CrawlSource | undefined, url: string, maxPages: number): Promise<CrawledDocument[]> {
+  if (INGESTION_CRAWLER !== "crawl4ai") {
+    throw new Error(`Crawl4AI dinyahaktifkan melalui INGESTION_CRAWLER=${INGESTION_CRAWLER}.`);
+  }
+
+  if (!fs.existsSync(CRAWL4AI_BRIDGE_PATH)) {
+    throw new Error(`Skrip Crawl4AI tidak ditemui di ${CRAWL4AI_BRIDGE_PATH}.`);
+  }
+
+  const args = [
+    CRAWL4AI_BRIDGE_PATH,
+    "--seed-url",
+    url,
+    "--source-name",
+    source?.name || "Manual URL",
+    "--category",
+    source?.category || "website",
+    "--max-pages",
+    String(maxPages),
+    "--max-depth",
+    String(maxPages > 1 ? CRAWL_MAX_DEPTH : 0),
+    "--min-chars",
+    process.env.CRAWL_MIN_CHARS || "450"
+  ];
+
+  for (const pattern of source?.includePatterns || []) {
+    args.push("--include-pattern", pattern);
+  }
+
+  const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve, reject) => {
+    const child = spawn(PYTHON_BIN, args, {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: "1"
+      }
+    });
+
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error(`Crawl4AI tamat masa selepas ${CRAWL4AI_TIMEOUT_MS}ms.`));
+    }, CRAWL4AI_TIMEOUT_MS);
+
+    child.stdout.on("data", chunk => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", chunk => {
+      stderr += chunk.toString();
+    });
+    child.on("error", err => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+    child.on("close", code => {
+      clearTimeout(timeout);
+      resolve({ stdout, stderr, code });
+    });
+  });
+
+  if (result.code !== 0) {
+    const stderr = result.stderr.trim();
+    throw new Error(stderr || `Crawl4AI keluar dengan kod ${result.code}.`);
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(result.stdout.trim());
+  } catch (err: any) {
+    throw new Error(`Output Crawl4AI tidak sah: ${err.message}`);
+  }
+
+  if (!parsed.ok) {
+    throw new Error(parsed.error || "Crawl4AI gagal tanpa mesej ralat.");
+  }
+
+  const documents = (parsed.documents || [])
+    .map((doc: any) => ({
+      url: doc.url || url,
+      title: doc.title || source?.name || "Rujukan Kontemporari",
+      content: doc.content || "",
+      sourceName: source?.name,
+      category: source?.category,
+      crawler: "crawl4ai",
+      depth: doc.depth
+    }))
+    .filter((doc: CrawledDocument) => doc.content.trim().length > 0);
+
+  if (documents.length === 0) {
+    throw new Error("Crawl4AI tidak memulangkan kandungan teks yang cukup untuk diindeks.");
+  }
+
+  return documents;
+}
+
+async function extractCleanContent(url: string, ai: GoogleGenAI): Promise<{ title: string; content: string; crawler: string }> {
   try {
     const response = await fetch(url, {
       headers: {
@@ -495,11 +1354,35 @@ ${cleanHtml.substring(0, 32000)}`,
 
     return {
       title: result.title || "Rujukan Kontemporari",
-      content: result.content || ""
+      content: result.content || "",
+      crawler: "gemini-html"
     };
   } catch (err: any) {
     console.error(`Crawler Error for ${url}:`, err.message);
     throw new Error(`Gagal melayari atau mengekstrak kandungan: ${err.message}`);
+  }
+}
+
+async function crawlDocumentsForIngestion(url: string, ai: GoogleGenAI, source?: CrawlSource, maxPagesOverride?: number): Promise<CrawledDocument[]> {
+  const maxPages = getSourceMaxPages(source, maxPagesOverride);
+
+  try {
+    return await runCrawl4AiBridge(source, url, maxPages);
+  } catch (crawl4AiErr: any) {
+    if (process.env.CRAWL4AI_FALLBACK_TO_GEMINI === "false") {
+      throw crawl4AiErr;
+    }
+
+    console.warn(`Crawl4AI fallback activated for ${url}:`, crawl4AiErr.message);
+    const fallbackDoc = await extractCleanContent(url, ai);
+    return [{
+      url,
+      title: fallbackDoc.title,
+      content: fallbackDoc.content,
+      sourceName: source?.name,
+      category: source?.category,
+      crawler: fallbackDoc.crawler
+    }];
   }
 }
 
@@ -523,45 +1406,8 @@ function chunkText(text: string, chunkSize: number = 1000, overlap: number = 200
   return chunks;
 }
 
-async function saveChunkToDB(pool: pg.Pool, content: string, embedding: number[], metadata: any) {
-  const client = await pool.connect();
-  try {
-    const query = `
-      INSERT INTO fatwa_chunks (content, embedding, metadata)
-      VALUES ($1, $2, $3)
-      RETURNING id;
-    `;
-    const vectorStr = "[" + embedding.join(",") + "]";
-    await client.query(query, [content, vectorStr, JSON.stringify(metadata)]);
-  } catch (err: any) {
-    console.error("Database Error saving vector chunk:", err.message);
-  } finally {
-    client.release();
-  }
-}
-
-async function searchVectorChunks(pool: pg.Pool, queryEmbedding: number[], limit: number = 3): Promise<string[]> {
-  const client = await pool.connect();
-  try {
-    const vectorStr = "[" + queryEmbedding.join(",") + "]";
-    const query = `
-      SELECT content
-      FROM fatwa_chunks
-      ORDER BY embedding <=> $1
-      LIMIT $2;
-    `;
-    const result = await client.query(query, [vectorStr, limit]);
-    return result.rows.map(row => row.content);
-  } catch (err: any) {
-    console.error("Database Error searching vectors:", err.message);
-    return [];
-  } finally {
-    client.release();
-  }
-}
-
 // ==========================================
-// GRAPHRAG KEYWORD SEARCH EXTRACRATORS
+// GRAPHRAG KEYWORD SEARCH EXTRACTORS
 // ==========================================
 function extractKeywords(text: string): string[] {
   const stopwords = new Set([
@@ -580,49 +1426,6 @@ function extractKeywords(text: string): string[] {
   return cleaned.split(/\s+/)
     .map(word => word.trim())
     .filter(word => word.length > 3 && !stopwords.has(word));
-}
-
-async function searchGraphTriples(pool: pg.Pool, keywords: string[]): Promise<string[]> {
-  if (keywords.length === 0) return [];
-  const client = await pool.connect();
-  try {
-    await client.query('LOAD \'age\'; SET search_path = ag_catalog, "$user", public;');
-    
-    const triples: string[] = [];
-    const selectedKeywords = keywords.slice(0, 2); // Pull top 2 keywords to avoid latency lag
-    
-    for (const keyword of selectedKeywords) {
-      const query = `
-        SELECT * FROM cypher('mursyid_graph', $$
-          MATCH (a:Entity)-[r:RELATION]->(b:Entity)
-          WHERE a.id CONTAINS $keyword OR b.id CONTAINS $keyword
-             OR a.label CONTAINS $keyword OR b.label CONTAINS $keyword
-          RETURN a.label, r.relation, b.label, a.description, b.description
-        $$, $1) as (source_label agtype, relation agtype, target_label agtype, source_desc agtype, target_desc agtype);
-      `;
-      
-      const params = JSON.stringify({ keyword });
-      const result = await client.query(query, [params]);
-      
-      for (const row of result.rows) {
-        const sourceLabel = parseAgtype(row.source_label);
-        const relation = parseAgtype(row.relation);
-        const targetLabel = parseAgtype(row.target_label);
-        const sourceDesc = parseAgtype(row.source_desc);
-        const targetDesc = parseAgtype(row.target_desc);
-        
-        const relName = relation?.properties?.relation || "BERKAITAN_DENGAN";
-        triples.push(`[Graf DB] ${sourceLabel} -> ${relName} -> ${targetLabel} (${sourceDesc || ""} | ${targetDesc || ""})`);
-      }
-    }
-    
-    return Array.from(new Set(triples)).slice(0, 10);
-  } catch (err: any) {
-    console.error("Database Error searching graph:", err.message);
-    return [];
-  } finally {
-    client.release();
-  }
 }
 
 function searchFallbackGraph(keywords: string[]): string[] {
@@ -654,14 +1457,33 @@ function searchFallbackGraph(keywords: string[]): string[] {
   return Array.from(new Set(triples)).slice(0, 10);
 }
 
+function mergeGraphIntoMemory(graphData: GraphExtraction) {
+  for (const node of (graphData.nodes || [])) {
+    const existingIdx = fallbackNodes.findIndex((n: any) => n.id.toLowerCase() === node.id.toLowerCase());
+    if (existingIdx >= 0) {
+      fallbackNodes[existingIdx] = { ...fallbackNodes[existingIdx], ...node };
+    } else {
+      fallbackNodes.push(node);
+    }
+  }
+
+  for (const link of (graphData.links || [])) {
+    const exists = fallbackLinks.some(
+      (l: any) => l.source.toLowerCase() === link.source.toLowerCase() &&
+                 l.target.toLowerCase() === link.target.toLowerCase() &&
+                 l.relation.toUpperCase() === link.relation.toUpperCase()
+    );
+    if (!exists) {
+      fallbackLinks.push(link);
+    }
+  }
+}
+
 // ==========================================
 // END-TO-END INGESTION CONTROL PIPELINE
 // ==========================================
-async function ingestURLContent(url: string, ai: GoogleGenAI): Promise<{ chunksCount: number; nodesCount: number; linksCount: number; title: string }> {
-  const pool = getPGPool();
-  
-  // 1. Scrape clean HTML with gemini-2.0-flash-lite
-  const { title, content } = await extractCleanContent(url, ai);
+async function ingestDocumentContent(document: CrawledDocument, ai: GoogleGenAI): Promise<IngestStats> {
+  const { url, title, content } = document;
   
   if (!content || content.trim().length === 0) {
     throw new Error("Laman web tidak mengandungi sebarang kandungan teks rencana yang bermaklumat.");
@@ -671,26 +1493,34 @@ async function ingestURLContent(url: string, ai: GoogleGenAI): Promise<{ chunksC
   let nodesCount = 0;
   let linksCount = 0;
   
-  // 2. Index to pgvector (chunks)
+  // 1. Prepare semantic chunks for BigQuery Vector Search.
   const chunks = chunkText(content, 1200, 200);
   chunksCount = chunks.length;
+  const documentId = documentIdFor(document);
+  const preparedChunks: PreparedChunk[] = [];
 
-  if (pool && isDbActive) {
-    for (const chunk of chunks) {
-      try {
-        const embedResponse = await ai.models.embedContent({
-          model: "text-embedding-004",
-          contents: chunk,
-        });
-        const embedding = embedResponse.embedding.values;
-        await saveChunkToDB(pool, chunk, embedding, { url, title, dateIndexed: new Date().toISOString() });
-      } catch (err: any) {
-        console.error(`Vector indexing failed for chunk under ${url}:`, err.message);
-      }
+  for (const [index, chunk] of chunks.entries()) {
+    let embedding: number[] = [];
+    try {
+      embedding = await generateTextEmbedding(ai, chunk);
+    } catch (err: any) {
+      console.error(`Embedding generation failed for chunk under ${url}:`, err.message);
     }
+
+    const chunkId = hashId(`${documentId}:${index}:${chunk}`, 24);
+    const metadata = { url, title, dateIndexed: new Date().toISOString(), documentId, chunkIndex: index };
+    preparedChunks.push({
+      chunkId,
+      documentId,
+      chunkIndex: index,
+      content: chunk,
+      embedding,
+      metadata,
+    });
+
   }
-  
-  // 3. Extract nodes and links for graph database (AGE/memory)
+
+  // 2. Extract nodes and links for BigQuery/Knowledge Catalog.
   const systemInstruction = 
     "Anda adalah pakar pengekstrakan maklumat teologi dan entiti undang-undang Islam. " +
     "Tugas anda adalah mengekstrak konsep Syariah, hukum fiqh, rujukan dalil (Al-Quran/Hadis), institusi autoriti (JAKIM, Mufti, dll), dan mazhab dari perbincangan atau teks yang diberikan " +
@@ -705,7 +1535,7 @@ async function ingestURLContent(url: string, ai: GoogleGenAI): Promise<{ chunksC
     "Setiap nod ID mestilah unik dan ringkas. Hubungan (links) antara nod mestilah menggambarkan relasi dalam Bahasa Melayu yang ringkas. " +
     "Pastikan teks bahasa pengantar adalah Bahasa Melayu/Malaysia.";
 
-  const prompt = `Analisis kandungan berikut daripada plans rencana "${title}": "${content.substring(0, 9000)}". Kenalpasti entiti perundangan Islam dan kaitannya, kemudian bina graf pengetahuan.`;
+  const prompt = `Analisis kandungan berikut daripada laman atau rencana "${title}" (${url}): "${content.substring(0, 9000)}". Kenalpasti entiti perundangan Islam dan kaitannya, kemudian bina graf pengetahuan.`;
 
   const response = await ai.models.generateContent({
     model: EXTRACTOR_MODEL,
@@ -748,9 +1578,13 @@ async function ingestURLContent(url: string, ai: GoogleGenAI): Promise<{ chunksC
   });
 
   const textResult = response.text || "{}";
-  let graphData;
+  let graphData: GraphExtraction;
   try {
-    graphData = JSON.parse(textResult.trim());
+    const parsed = JSON.parse(textResult.trim());
+    graphData = {
+      nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
+      links: Array.isArray(parsed.links) ? parsed.links : [],
+    };
   } catch (parseErr) {
     console.error("JSON Parsing Error from Gemini output during ingestion:", textResult);
     throw new Error("Gagal mengurai Graf Pengetahuan daripada output model kecerdasan buatan.");
@@ -759,38 +1593,60 @@ async function ingestURLContent(url: string, ai: GoogleGenAI): Promise<{ chunksC
   nodesCount = graphData.nodes?.length || 0;
   linksCount = graphData.links?.length || 0;
 
-  if (pool && isDbActive) {
-    // Persistent Apache AGE updates
-    for (const node of (graphData.nodes || [])) {
-      await saveNodeToGraph(pool, node);
-    }
-    for (const link of (graphData.links || [])) {
-      await saveLinkToGraph(pool, link);
-    }
-  } else {
-    // Memory fallback updates
-    for (const node of (graphData.nodes || [])) {
-      const existingIdx = fallbackNodes.findIndex((n: any) => n.id.toLowerCase() === node.id.toLowerCase());
-      if (existingIdx >= 0) {
-        fallbackNodes[existingIdx] = { ...fallbackNodes[existingIdx], ...node };
-      } else {
-        fallbackNodes.push(node);
-      }
-    }
+  const gcpStatus = await persistGcpNativeKnowledge(document, preparedChunks, graphData);
+  mergeGraphIntoMemory(graphData);
 
-    for (const link of (graphData.links || [])) {
-      const exists = fallbackLinks.some(
-        (l: any) => l.source.toLowerCase() === link.source.toLowerCase() &&
-                   l.target.toLowerCase() === link.target.toLowerCase() &&
-                   l.relation.toUpperCase() === link.relation.toUpperCase()
-      );
-      if (!exists) {
-        fallbackLinks.push(link);
-      }
-    }
+  return {
+    chunksCount,
+    nodesCount,
+    linksCount,
+    title,
+	    documentsCount: 1,
+	    crawler: document.crawler,
+	    gcsStatus: gcpStatus.gcsStatus,
+	    bigQueryStatus: gcpStatus.bigQueryStatus,
+	    knowledgeCatalogStatus: gcpStatus.knowledgeCatalogStatus,
+	    metadataCatalogPath: gcpStatus.metadataCatalogPath,
+	    gcsRawUris: gcpStatus.gcsRawUri ? [gcpStatus.gcsRawUri] : []
+	  };
+}
+
+async function ingestURLContent(url: string, ai: GoogleGenAI, source?: CrawlSource, maxPagesOverride?: number): Promise<IngestStats> {
+  const documents = await crawlDocumentsForIngestion(url, ai, source, maxPagesOverride);
+  const aggregate: IngestStats = {
+    title: documents[0]?.title || source?.name || "Rujukan Kontemporari",
+    chunksCount: 0,
+    nodesCount: 0,
+    linksCount: 0,
+    documentsCount: documents.length,
+    crawler: documents[0]?.crawler || "unknown",
+    gcsStatus: "SKIPPED_NOT_CONFIGURED",
+    bigQueryStatus: "SKIPPED_NOT_CONFIGURED",
+    knowledgeCatalogStatus: "SKIPPED_NOT_CONFIGURED",
+    gcsRawUris: []
+  };
+  const gcsStatuses: GcpPipelineStatus[] = [];
+  const bigQueryStatuses: GcpPipelineStatus[] = [];
+  const knowledgeCatalogStatuses: GcpPipelineStatus[] = [];
+
+  for (const document of documents) {
+    const stats = await ingestDocumentContent(document, ai);
+    aggregate.chunksCount += stats.chunksCount;
+    aggregate.nodesCount += stats.nodesCount;
+    aggregate.linksCount += stats.linksCount;
+    aggregate.gcsRawUris.push(...stats.gcsRawUris);
+    aggregate.metadataCatalogPath = stats.metadataCatalogPath || aggregate.metadataCatalogPath;
+    gcsStatuses.push(stats.gcsStatus);
+    bigQueryStatuses.push(stats.bigQueryStatus);
+    knowledgeCatalogStatuses.push(stats.knowledgeCatalogStatus);
   }
 
-  return { chunksCount, nodesCount, linksCount, title };
+  aggregate.gcsStatus = summarizePipelineStatus(gcsStatuses);
+  aggregate.bigQueryStatus = summarizePipelineStatus(bigQueryStatuses);
+  aggregate.knowledgeCatalogStatus = summarizePipelineStatus(knowledgeCatalogStatuses);
+  aggregate.crawler = Array.from(new Set(documents.map(doc => doc.crawler))).join("+") || aggregate.crawler;
+
+  return aggregate;
 }
 
 // ==========================================
@@ -805,8 +1661,7 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: "Mesej diperlukan." });
     }
 
-    const reqApiKey = getRequestApiKey(req);
-    const ai = getGeminiClient(reqApiKey);
+    const ai = getGeminiClient();
 
     const systemInstruction = 
       "Anda adalah seorang Ejen Kepakaran Syariah dan Fiqh Islam (Shafi'i) bertauliah di Malaysia. " +
@@ -816,60 +1671,58 @@ app.post("/api/chat", async (req, res) => {
       "Cakap dengan sandaran dalil yang jelas dari Al-Quran dan Al-Sunnah jika bersesuaian, dan nyatakan sumber rujukan fatwa secara eksplisit. " +
       "Apabila pengguna bertanyakan isu semasa (contohnya pelaburan kripto, vaksin, waktu solat), gunakan keputusan mufti yang sah di Malaysia.";
 
-    // GRAPH-RETRIEVAL AUGMENTED GENERATION (GraphRAG) LAYER
-    let groundedContext = "";
-    const keywords = extractKeywords(message);
-    const pool = getPGPool();
+	    // GCP-native grounded retrieval layer
+		    let groundedContext = "";
+		    let citations: Citation[] = [];
+		    const keywords = extractKeywords(message);
 
-    if (pool && isDbActive) {
-      try {
-        console.log(`GraphRAG: Initiating database context search for: "${message}"`);
-        // A. pgvector Semantic Search
-        let vectorChunks: string[] = [];
-        try {
-          const embedResponse = await ai.models.embedContent({
-            model: "text-embedding-004",
-            contents: message,
-          });
-          const queryEmbedding = embedResponse.embedding.values;
-          vectorChunks = await searchVectorChunks(pool, queryEmbedding, 3);
-        } catch (vErr: any) {
-          console.warn("GraphRAG Vector Retrieval Offline:", vErr.message);
-        }
+		    if (isGcpNativeConfigured()) {
+	      try {
+	        console.log(`GCP Native Retrieval: BigQuery + Knowledge Catalog context search for: "${message}"`);
+		        const vectorChunks = await searchBigQueryVectorChunks(ai, message, 3);
+		        const graphTriples = await searchBigQueryGraphTriples(keywords);
 
-        // B. Apache AGE Cypher Retrieval
-        const graphTriples = await searchGraphTriples(pool, keywords);
+		        if (vectorChunks.length > 0 || graphTriples.length > 0) {
+		          groundedContext += "\n\nMAKLUMAT SAHIH DARIPADA BIGQUERY VECTOR SEARCH & KNOWLEDGE CATALOG MURSYID AI:\n";
+	          groundedContext += "==========================================================================\n";
+		          if (graphTriples.length > 0) {
+		            groundedContext += "ENTITI & HUBUNGAN ONTOLOGI SYARAK (KNOWLEDGE CATALOG / BIGQUERY GRAPH):\n";
+		            groundedContext += graphTriples.map(triple => triple.text).join("\n") + "\n\n";
+		            citations.push(...graphTriples.map(triple => ({
+		              title: triple.title || triple.sourceUrl || "Knowledge Catalog graph source",
+		              url: triple.sourceUrl,
+		              source: "knowledge-catalog-graph" as const,
+		              documentId: triple.documentId,
+		            })));
+		          }
+		          if (vectorChunks.length > 0) {
+		            groundedContext += "KERATAN TEKS PECAHAN (BIGQUERY VECTOR SEARCH):\n";
+		            groundedContext += vectorChunks.map((chunk, i) => {
+		              const sourceLabel = `${chunk.title || chunk.sourceUrl} (${chunk.sourceUrl})`;
+		              return `[Sumber Rencana ${i + 1} | ${sourceLabel} | document_id=${chunk.documentId} | chunk=${chunk.chunkIndex}]: ${chunk.content}`;
+		            }).join("\n") + "\n";
+		            citations.push(...vectorChunks.map(chunkCitation));
+		          }
+		        }
+	      } catch (gcpErr: any) {
+	        console.error("Failed to compile GCP-native grounding context:", gcpErr.message);
+		      }
+		    }
+	
+	    // In-memory GraphRAG fallback for local/offline development.
+		    if (!groundedContext && keywords.length > 0) {
+		      const memoryTriples = searchFallbackGraph(keywords);
+		      if (memoryTriples.length > 0) {
+	        groundedContext += "\n\nMAKLUMAT GRAPHRAG ASAS DARIPADA MEMORI LOKAL MURSYID AI:\n";
+	        groundedContext += "=========================================================\n";
+	        groundedContext += "ENTITI & HUBUNGAN ONTOLOGI SYARAK (LOCAL MEMORY):\n";
+	        groundedContext += memoryTriples.join("\n") + "\n";
+	      }
+	    }
+	    citations = dedupeCitations(citations);
 
-        if (vectorChunks.length > 0 || graphTriples.length > 0) {
-          groundedContext += "\n\nMAKLUMAT GRAPHRAG SAHIH DARIPADA DATABASE PERSISTEN MURSYID AI:\n";
-          groundedContext += "===============================================================\n";
-          if (graphTriples.length > 0) {
-            groundedContext += "ENTITI & HUBUNGAN ONTOLOGI SYARAK (APACHE AGE):\n";
-            groundedContext += graphTriples.join("\n") + "\n\n";
-          }
-          if (vectorChunks.length > 0) {
-            groundedContext += "KERATAN TEKS PECAHAN (PGVECTOR SIMILARITY SEARCH):\n";
-            groundedContext += vectorChunks.map((c, i) => `[Sumber Rencana ${i+1}]: ${c}`).join("\n") + "\n";
-          }
-        }
-      } catch (ragErr: any) {
-        console.error("Failed to compile Database GraphRAG Context:", ragErr.message);
-      }
-    }
-
-    // In-memory GraphRAG fallback if database is offline or ungrounded
-    if (!groundedContext && keywords.length > 0) {
-      const memoryTriples = searchFallbackGraph(keywords);
-      if (memoryTriples.length > 0) {
-        groundedContext += "\n\nMAKLUMAT GRAPHRAG SAHIH DARIPADA MEMORI GRY MURSYID AI:\n";
-        groundedContext += "=========================================================\n";
-        groundedContext += "ENTITI & HUBUNGAN ONTOLOGI SYARAK (MOCK-GRAPH):\n";
-        groundedContext += memoryTriples.join("\n") + "\n";
-      }
-    }
-
-    // Append our grounding context block directly into the Gemini instructions
-    const finalSystemInstruction = systemInstruction + (groundedContext ? `\n\nSila berikan keutamaan tertinggi kepada data rujukan di bawah untuk menyusun hujah jawapan anda:\n${groundedContext}` : "");
+	    // Append our grounding context block directly into the Gemini instructions
+	    const finalSystemInstruction = systemInstruction + (groundedContext ? `\n\nSila berikan keutamaan tertinggi kepada data rujukan di bawah untuk menyusun hujah jawapan anda. Jangan gunakan carian web umum sebagai sumber utama; gunakan hanya konteks BigQuery Vector Search dan Knowledge Catalog/BigQuery Graph di bawah apabila tersedia. Apabila merujuk sumber, sebut nama portal/tajuk yang muncul dalam konteks.\n${groundedContext}` : "");
 
     const formattedHistory = (history || []).map((h: any) => ({
       role: h.role === "user" ? "user" : "model",
@@ -878,176 +1731,35 @@ app.post("/api/chat", async (req, res) => {
 
     const contents = [...formattedHistory, { role: "user", parts: [{ text: message }] }];
 
-    const response = await ai.models.generateContent({
-      model: CHAT_MODEL,
-      contents,
-      config: {
-        systemInstruction: finalSystemInstruction,
-        temperature: 0.15, // Extremely low temperature to enforce strict adherence to groundings
-        tools: [{ googleSearch: {} }],
-      }
-    });
-
-    const text = response.text || "Maaf, tiada jawapan dijana.";
-    const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-    
-    const citations = chunks.map((chunk: any) => ({
-      title: chunk.web?.title || chunk.web?.uri || "Rujukan Sahih",
-      url: chunk.web?.uri || "",
-    })).filter(c => c.url !== "");
-
-    res.json({ text, citations });
+	    const response = await ai.models.generateContent({
+	      model: CHAT_MODEL,
+	      contents,
+	      config: {
+	        systemInstruction: finalSystemInstruction,
+	        temperature: 0.15, // Extremely low temperature to enforce strict adherence to groundings
+	      }
+	    });
+	
+	    const text = response.text || "Maaf, tiada jawapan dijana.";
+	
+	    res.json({ text, citations });
   } catch (error: any) {
     console.error("Chat Error:", error);
     res.status(500).json({ 
       error: error.message || "An unexpected error occurred",
-      needsApiKey: error.message?.includes("configured") || !process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY.includes("MY_GEMINI_API_KEY")
+      needsAdc: !isAdcConfigured()
     });
   }
 });
 
-// 2. Structured endpoint to extract Knowledge Graph elements from a query or text segment
-app.post("/api/extract-graph", async (req, res) => {
-  try {
-    const { text } = req.body;
-    if (!text) {
-      return res.status(400).json({ error: "Teks diperlukan." });
-    }
-
-    const reqApiKey = getRequestApiKey(req);
-    const ai = getGeminiClient(reqApiKey);
-
-    const systemInstruction = 
-      "Anda adalah pakar pengekstrakan maklumat teologi dan entiti undang-undang Islam. " +
-      "Tugas anda adalah mengekstrak konsep Syariah, hukum fiqh, rujukan dalil (Al-Quran/Hadis), institusi autoriti (JAKIM, Mufti, dll), dan mazhab dari perbincangan atau teks yang diberikan " +
-      "dan menyusunnya dalam struktur nod (nodes) dan hubungan (links) Graf Pengetahuan (Knowledge Graph). " +
-      "Setiap nod mesti mempunyai jenis (type) yang bersesuaian antara salah satu berikut: " +
-      "1. 'Konsep' (e.g. Puasa, Solat, Hadis Palsu, Riba, Kripto, Pusaka) " +
-      "2. 'Hukum' (e.g. Wajib, Sunat, Harus, Makruh, Haram, Sah, Batal) " +
-      "3. 'Sumber' (e.g. Al-Quran, Al-Hadith, Al-Ijma', Al-Qiyas) " +
-      "4. 'Mazhab' (e.g. Mazhab Syafi'i, Mazhab Hanafi, Mazhab Maliki, Mazhab Hanbali) " +
-      "5. 'Institusi' (e.g. JAKIM, Jabatan Mufti WP, Jawatankuasa Fatwa Kebangsaan) " +
-      "6. 'Artikkel' (Satu daripada 10 laman rujukan khusus yang dibincangkan) " +
-      "Setiap nod ID mestilah unik dan ringkas. Hubungan (links) antara nod mestilah menggambarkan relasi sebenar (tulis nama relasi dalam Bahasa Melayu yang ringkas seperti 'RULING_ON', 'DIKAWAL_OLEH', 'BERASASKAN_SABDA', 'DIPUTUSKAN_OLEH', 'MAZHAB_UTAMA'). " +
-      "Pastikan teks bahasa pengantar adalah Bahasa Melayu/Malaysia.";
-
-    const prompt = `Analisis teks atau topik berikut: "${text}". Kenalpasti entiti perundangan Islam dan kaitannya, kemudian bina graf pengetahuan. Hubungkan entiti dengan sumber sahih fiqh, fatwa Malaysia, hukum yang berkenaan, serta rujukan yang sesuai.`;
-
-    const response = await ai.models.generateContent({
-      model: EXTRACTOR_MODEL,
-      contents: prompt,
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          required: ["nodes", "links"],
-          properties: {
-            nodes: {
-              type: Type.ARRAY,
-              description: "Senarai nod graf pengetahuan",
-              items: {
-                type: Type.OBJECT,
-                required: ["id", "type", "label", "description"],
-                properties: {
-                  id: { type: Type.STRING, description: "ID nod yang unik (cth: 'mazhab_syafii', 'riba', 'jakim')" },
-                  type: { type: Type.STRING, description: "Jenis salah satu daripada: 'Konsep', 'Hukum', 'Sumber', 'Mazhab', 'Institusi', 'Artikkel'" },
-                  label: { type: Type.STRING, description: "Label pendek manusiawi untuk visualisasi (cth: 'Mazhab Syafi'i')" },
-                  description: { type: Type.STRING, description: "Penerangan ringkas tentang entiti ini dalam konteks Syariah" }
-                }
-              }
-            },
-            links: {
-              type: Type.ARRAY,
-              description: "Senarai pautan/hubungan antara nod graf pengetahuan",
-              items: {
-                type: Type.OBJECT,
-                required: ["source", "target", "relation"],
-                properties: {
-                  source: { type: Type.STRING, description: "ID nod asal" },
-                  target: { type: Type.STRING, description: "ID nod sasaran" },
-                  relation: { type: Type.STRING, description: "Jenis hubungan (cth: 'SANDARAN_UTAMA', 'HUKUM_HAKIKI', 'DIKELUARKAN_OLEH')" }
-                }
-              }
-            }
-          }
-        }
-      }
-    });
-
-    const textResult = response.text || "{}";
-    let graphData;
-    try {
-      graphData = JSON.parse(textResult.trim());
-    } catch (parseErr) {
-      console.error("JSON Parsing Error from Gemini output:", textResult);
-      throw new Error("Gagal mengurai Graf Pengetahuan daripada output kecerdasan buatan.");
-    }
-
-    // Persist Graph to DB if Active
-    const pool = getPGPool();
-    if (pool) {
-      if (!dbInitialized) {
-        await initializeDatabase(pool);
-      }
-      if (isDbActive) {
-        console.log("Database: Saving extracted nodes & links...");
-        for (const node of graphData.nodes) {
-          await saveNodeToGraph(pool, node);
-        }
-        for (const link of graphData.links) {
-          await saveLinkToGraph(pool, link);
-        }
-        const fullGraph = await getFullGraph(pool);
-        return res.json(fullGraph);
-      }
-    }
-
-    // In-memory fallback
-    console.log("Database: Offline. Merging graph elements in-memory...");
-    for (const node of graphData.nodes) {
-      const existingIdx = fallbackNodes.findIndex((n: any) => n.id.toLowerCase() === node.id.toLowerCase());
-      if (existingIdx >= 0) {
-        fallbackNodes[existingIdx] = { ...fallbackNodes[existingIdx], ...node };
-      } else {
-        fallbackNodes.push(node);
-      }
-    }
-
-    for (const link of graphData.links) {
-      const exists = fallbackLinks.some(
-        (l: any) => l.source.toLowerCase() === link.source.toLowerCase() &&
-                   l.target.toLowerCase() === link.target.toLowerCase() &&
-                   l.relation.toUpperCase() === link.relation.toUpperCase()
-      );
-      if (!exists) {
-        fallbackLinks.push(link);
-      }
-    }
-
-    res.json({ nodes: fallbackNodes, links: fallbackLinks });
-  } catch (error: any) {
-    console.error("Extract Graph Error:", error);
-    res.status(500).json({ 
-      error: error.message || "An unexpected error occurred",
-      needsApiKey: error.message?.includes("configured") || !process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY.includes("MY_GEMINI_API_KEY")
-    });
-  }
-});
-
-// 3. Query the unified mesh graph state
+// 2. Query the unified mesh graph state
 app.get("/api/get-graph", async (req, res) => {
   try {
-    const pool = getPGPool();
-    if (pool) {
-      if (!dbInitialized) {
-        await initializeDatabase(pool);
-      }
-      if (isDbActive) {
-        const fullGraph = await getFullGraph(pool);
-        return res.json(fullGraph);
-      }
+    const nativeGraph = await getFullGraphFromBigQuery();
+    if (nativeGraph) {
+      return res.json(nativeGraph);
     }
+
     res.json({ nodes: fallbackNodes, links: fallbackLinks });
   } catch (error: any) {
     console.error("Get Graph Error:", error);
@@ -1055,20 +1767,16 @@ app.get("/api/get-graph", async (req, res) => {
   }
 });
 
-// 4. Reset the entire graph state (in DB or memory fallback)
+// 3. Reset the graph state in BigQuery or local memory fallback.
 app.post("/api/reset-graph", async (req, res) => {
   try {
-    const pool = getPGPool();
-    if (pool) {
-      if (!dbInitialized) {
-        await initializeDatabase(pool);
-      }
-      if (isDbActive) {
-        await resetGraphInDB(pool);
-        const fullGraph = await getFullGraph(pool);
-        return res.json(fullGraph);
-      }
+    const nativeGraph = await resetBigQueryGraph();
+    if (nativeGraph) {
+      fallbackNodes = JSON.parse(JSON.stringify(INITIAL_NODES));
+      fallbackLinks = JSON.parse(JSON.stringify(INITIAL_LINKS));
+      return res.json(nativeGraph);
     }
+
     fallbackNodes = JSON.parse(JSON.stringify(INITIAL_NODES));
     fallbackLinks = JSON.parse(JSON.stringify(INITIAL_LINKS));
     res.json({ nodes: fallbackNodes, links: fallbackLinks });
@@ -1088,13 +1796,12 @@ app.post("/api/ingest-url", async (req, res) => {
       return res.status(400).json({ error: "URL diperlukan." });
     }
 
-    const reqApiKey = getRequestApiKey(req);
-    const ai = getGeminiClient(reqApiKey);
+    const ai = getGeminiClient();
 
-    const stats = await ingestURLContent(url, ai);
+    const stats = await ingestURLContent(url, ai, undefined, 1);
     res.json({
       success: true,
-      message: `Berjaya mengindeks "${stats.title}".`,
+      message: `Berjaya mengindeks "${stats.title}" melalui ${stats.crawler}.`,
       stats
     });
   } catch (error: any) {
@@ -1103,11 +1810,49 @@ app.post("/api/ingest-url", async (req, res) => {
   }
 });
 
+app.get("/api/crawl-sources", (req, res) => {
+  res.json({
+    sources: SOURCE_PORTALS,
+	    config: {
+	      crawler: INGESTION_CRAWLER,
+	      maxDepth: CRAWL_MAX_DEPTH,
+	      maxPagesPerSource: CRAWL_MAX_PAGES_PER_SOURCE,
+	      gcpNativeEnabled: isGcpNativeConfigured(),
+	      gcpProjectId: GCP_PROJECT_ID,
+	      gcpLocation: GCP_LOCATION,
+	      bigQueryDataset: BQ_DATASET,
+	      bigQueryCorpusTable: BQ_CORPUS_TABLE,
+	      bigQueryChunksTable: BQ_CHUNKS_TABLE,
+	      bigQueryGraphTable: BQ_GRAPH_TABLE,
+	      bigQueryEmbeddingModel: BQ_EMBEDDING_MODEL,
+	      cloudStorageRawBucket: GCS_RAW_BUCKET,
+	      knowledgeCatalogEntryGroup: KNOWLEDGE_CATALOG_ENTRY_GROUP
+	    }
+	  });
+});
+
 app.get("/api/crawl-logs", (req, res) => {
   res.json({
     isCrawling: isBatchCrawling,
-    logs: batchCrawlLogs
-  });
+    logs: batchCrawlLogs,
+    sources: SOURCE_PORTALS,
+    total: SOURCE_PORTALS.length,
+	    config: {
+	      crawler: INGESTION_CRAWLER,
+	      maxDepth: CRAWL_MAX_DEPTH,
+	      maxPagesPerSource: CRAWL_MAX_PAGES_PER_SOURCE,
+	      gcpNativeEnabled: isGcpNativeConfigured(),
+	      gcpProjectId: GCP_PROJECT_ID,
+	      gcpLocation: GCP_LOCATION,
+	      bigQueryDataset: BQ_DATASET,
+	      bigQueryCorpusTable: BQ_CORPUS_TABLE,
+	      bigQueryChunksTable: BQ_CHUNKS_TABLE,
+	      bigQueryGraphTable: BQ_GRAPH_TABLE,
+	      bigQueryEmbeddingModel: BQ_EMBEDDING_MODEL,
+	      cloudStorageRawBucket: GCS_RAW_BUCKET,
+	      knowledgeCatalogEntryGroup: KNOWLEDGE_CATALOG_ENTRY_GROUP
+	    }
+	  });
 });
 
 app.post("/api/ingest-batch", async (req, res) => {
@@ -1115,10 +1860,9 @@ app.post("/api/ingest-batch", async (req, res) => {
     return res.status(400).json({ error: "Proses merangkak (batch crawling) sedang berjalan." });
   }
 
-  const reqApiKey = getRequestApiKey(req);
   let ai;
   try {
-    ai = getGeminiClient(reqApiKey);
+    ai = getGeminiClient();
   } catch (err: any) {
     return res.status(400).json({ error: err.message });
   }
@@ -1126,65 +1870,53 @@ app.post("/api/ingest-batch", async (req, res) => {
   isBatchCrawling = true;
   batchCrawlLogs = [];
 
-  // limited sequence list of target official portals for fast execution
-  const targetUrls = [
-    "https://muftiwp.gov.my/ms/artikel/irsyad-hukum",
-    "https://muftiwp.gov.my/ms/artikel/bayan-linnas",
-    "https://muftiwp.gov.my/ms/artikel/al-kafi-li-al-fatawi",
-    "https://www.waktusolat.digital",
-    "https://myhadith.islam.gov.my",
-    "https://i-fiqh.islam.gov.my/portal/"
-  ];
-
   // Fire-and-forget background crawling
   (async () => {
-    for (const url of targetUrls) {
-      const timeStr = new Date().toLocaleTimeString("en-US", { timeZone: "Asia/Kuala_Lumpur" });
-      const logEntry = {
-        url,
+    for (const source of SOURCE_PORTALS) {
+      const timeStr = getCrawlTimeString();
+      const maxPages = getSourceMaxPages(source);
+      const logEntry: CrawlLog = {
+        sourceId: source.id,
+        sourceName: source.name,
+        url: source.url,
         title: "Penganalisisan Laman...",
         status: "RUNNING",
-        log: "Memulakan sambungan HTML Scraper...",
+        log: `Memulakan Crawl4AI (${maxPages} halaman maks, kedalaman ${CRAWL_MAX_DEPTH}) untuk ${source.category}.`,
         time: timeStr
       };
       batchCrawlLogs.push(logEntry);
 
       try {
-        console.log(`Crawler: Ingesting URL: ${url}`);
-        const stats = await ingestURLContent(url, ai);
+        console.log(`Crawler: Ingesting source: ${source.name} (${source.url})`);
+        const stats = await ingestURLContent(source.url, ai, source);
         
         logEntry.title = stats.title;
         logEntry.status = "SUCCESS";
-        logEntry.log = `Mengindeks ${stats.chunksCount} paragraf teks (pgvector) dan mengekstrak ${stats.nodesCount} entiti perundangan Islam (Apache AGE).`;
+        logEntry.pagesCount = stats.documentsCount;
+        logEntry.chunksCount = stats.chunksCount;
+        logEntry.nodesCount = stats.nodesCount;
+	        logEntry.linksCount = stats.linksCount;
+	        logEntry.crawler = stats.crawler;
+	        logEntry.gcsStatus = stats.gcsStatus;
+	        logEntry.bigQueryStatus = stats.bigQueryStatus;
+	        logEntry.knowledgeCatalogStatus = stats.knowledgeCatalogStatus;
+	        logEntry.log = `Mengindeks ${stats.documentsCount} dokumen/${stats.chunksCount} chunks ke BigQuery Vector Search, mengekstrak ${stats.nodesCount} nod + ${stats.linksCount} hubungan, GCS: ${stats.gcsStatus}, Knowledge Catalog: ${stats.knowledgeCatalogStatus}.`;
       } catch (err: any) {
-        console.error(`Crawler Error for ${url}:`, err.message);
+        console.error(`Crawler Error for ${source.url}:`, err.message);
         logEntry.status = "FAILED";
         logEntry.log = `Gagal diindeks: ${err.message}`;
       }
 
-      logEntry.time = new Date().toLocaleTimeString("en-US", { timeZone: "Asia/Kuala_Lumpur" });
+      logEntry.time = getCrawlTimeString();
     }
     isBatchCrawling = false;
   })();
 
-  res.json({ success: true, message: "Proses crawler diaktifkan di latar belakang." });
+	  res.json({ success: true, message: "Proses crawler Crawl4AI + BigQuery/Knowledge Catalog diaktifkan di latar belakang.", total: SOURCE_PORTALS.length });
 });
 
 // Setup Vite Dev server or Serve build files
 async function startServer() {
-  const pool = getPGPool();
-  if (pool) {
-    initializeDatabase(pool).then(active => {
-      if (active) {
-        console.log("Database: Connected and fully initialized on startup.");
-      } else {
-        console.log("Database: Failed connection on startup. Running in memory fallback.");
-      }
-    }).catch(err => {
-      console.log("Database Error on Startup:", err.message);
-    });
-  }
-
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },

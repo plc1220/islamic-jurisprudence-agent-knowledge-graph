@@ -4,11 +4,28 @@ project_id = "YOUR_GCP_PROJECT_ID"
 # Region of deployment
 region = "asia-southeast1"
 
+# Gemini / Vertex AI endpoint location for ADC-authenticated model calls
+gemini_location = "global"
+
 # Service name on Cloud Run
 service_name = "mursyid-ai"
 
 # Artifact registry repository name
 repository_name = "mursyid-repo"
 
-# Strong password for Cloud SQL PostgreSQL administrator user
-postgres_db_password = "SUPER_SECURE_ADMIN_PASSWORD_123!"
+# Bootstrap platform resources first; deploy the app with Cloud Build after an image exists.
+deploy_cloud_run = false
+
+# GCP-native knowledge platform
+bq_dataset                       = "mursyid_knowledge"
+bq_corpus_table                  = "corpus"
+bq_chunks_table                  = "chunks"
+bq_graph_table                   = "graph_edges"
+bq_embedding_model               = "text-embedding-004"
+gcs_raw_bucket_name              = "" # defaults to <project_id>-mursyid-raw
+knowledge_catalog_entry_group    = "mursyid-knowledge"
+knowledge_catalog_entry_type     = "mursyid-knowledge-entry"
+knowledge_catalog_aspect_type    = "mursyid-context"
+
+# GitHub Actions OIDC deployment access
+github_repository = "plc1220/islamic-jurisprudence-agent-knowledge-graph"

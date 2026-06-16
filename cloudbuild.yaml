@@ -27,14 +27,24 @@ steps:
       - '--platform'
       - 'managed'
       - '--allow-unauthenticated'
+      - '--service-account'
+      - 'mursyid-runtime@${PROJECT_ID}.iam.gserviceaccount.com'
       - '--port'
       - '3000'
+      - '--memory'
+      - '4Gi'
+      - '--cpu'
+      - '2'
+      - '--max-instances'
+      - '1'
+      - '--no-cpu-throttling'
+      - '--timeout'
+      - '900'
+      - '--remove-secrets'
+      - 'GEMINI_API_KEY'
       # Production Environment Configuration
       - '--set-env-vars'
-      - 'NODE_ENV=production,CRAWLER_MODEL=gemini-3.1-flash-lite,CHAT_MODEL=gemini-3.5-flash,EXTRACTOR_MODEL=gemini-3.5-flash'
-      # Securely fetch sensitive tokens from Secret Manager
-      - '--set-secrets'
-      - 'GEMINI_API_KEY=GEMINI_API_KEY:latest'
+      - 'NODE_ENV=production,CRAWLER_MODEL=gemini-3.1-flash-lite,CHAT_MODEL=gemini-3.5-flash,EXTRACTOR_MODEL=gemini-3.5-flash,GOOGLE_GENAI_USE_ENTERPRISE=true,GOOGLE_GENAI_USE_VERTEXAI=true,GCP_PROJECT_ID=${PROJECT_ID},GCP_LOCATION=${_GCP_LOCATION},GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GEMINI_LOCATION=${_GEMINI_LOCATION},GOOGLE_CLOUD_LOCATION=${_GEMINI_LOCATION},INGESTION_CRAWLER=crawl4ai,CRAWL_MAX_DEPTH=${_CRAWL_MAX_DEPTH},CRAWL_MAX_PAGES_PER_SOURCE=${_CRAWL_MAX_PAGES_PER_SOURCE},CRAWL4AI_TIMEOUT_MS=${_CRAWL4AI_TIMEOUT_MS},BQ_DATASET=${_BQ_DATASET},BQ_CORPUS_TABLE=${_BQ_CORPUS_TABLE},BQ_CHUNKS_TABLE=${_BQ_CHUNKS_TABLE},BQ_GRAPH_TABLE=${_BQ_GRAPH_TABLE},BQ_EMBEDDING_MODEL=${_BQ_EMBEDDING_MODEL},GCS_RAW_BUCKET=${_GCS_RAW_BUCKET},KNOWLEDGE_CATALOG_ENTRY_GROUP=${_KNOWLEDGE_CATALOG_ENTRY_GROUP},KNOWLEDGE_CATALOG_ENTRY_TYPE=${_KNOWLEDGE_CATALOG_ENTRY_TYPE},KNOWLEDGE_CATALOG_ASPECT_TYPE=${_KNOWLEDGE_CATALOG_ASPECT_TYPE},MDCODE_EXPORT_DIR=/tmp/catalog-export'
 
 images:
   - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${_VERSION}'
@@ -44,6 +54,20 @@ substitutions:
   _REPOSITORY: 'mursyid-repo' # Target Google Artifact Registry repository
   _SERVICE_NAME: 'mursyid-ai' # Target Cloud Run service name
   _VERSION: 'latest' # Target version tag (default: latest, can be overwritten on CLI)
+  _GCP_LOCATION: 'asia-southeast1'
+  _GEMINI_LOCATION: 'global'
+  _CRAWL_MAX_DEPTH: '1'
+  _CRAWL_MAX_PAGES_PER_SOURCE: '3'
+  _CRAWL4AI_TIMEOUT_MS: '180000'
+  _BQ_DATASET: 'mursyid_knowledge'
+  _BQ_CORPUS_TABLE: 'corpus'
+  _BQ_CHUNKS_TABLE: 'chunks'
+  _BQ_GRAPH_TABLE: 'graph_edges'
+  _BQ_EMBEDDING_MODEL: 'text-embedding-004'
+  _GCS_RAW_BUCKET: ''
+  _KNOWLEDGE_CATALOG_ENTRY_GROUP: 'mursyid-knowledge'
+  _KNOWLEDGE_CATALOG_ENTRY_TYPE: 'mursyid-knowledge-entry'
+  _KNOWLEDGE_CATALOG_ASPECT_TYPE: 'mursyid-context'
 
 options:
   logging: CLOUD_LOGGING_ONLY

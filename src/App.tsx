@@ -7,17 +7,11 @@ import {
   Compass,
   Send,
   HelpCircle,
-  FileText,
   AlertTriangle,
-  RotateCcw,
-  Book,
   ExternalLink,
   Brain,
-  Sparkles,
-  Search,
   CheckCircle2,
   Lock,
-  Key,
   Globe,
 } from "lucide-react";
 
@@ -26,13 +20,14 @@ import { OFFICIAL_SOURCES, PRESET_QUESTIONS, INITIAL_NODES, INITIAL_LINKS } from
 import { KnowledgeGraph } from "./components/KnowledgeGraph";
 import { SourceCard } from "./components/SourceCard";
 import { ArchitectureExplainer } from "./components/ArchitectureExplainer";
-import { ParserSimulator } from "./components/ParserSimulator";
 import { CrawlerPanel } from "./components/CrawlerPanel";
+import { ChatMarkdownRenderer } from "./components/ChatMarkdownRenderer";
 
 export default function App() {
   // Navigation State
   const [activeTab, setActiveTab] = useState<"chat" | "graph" | "sources" | "engineering">("chat");
-  const [localApiKey, setLocalApiKey] = useState<string>(localStorage.getItem("mursyid_gemini_api_key") || "");
+  const [graphSubTab, setGraphSubTab] = useState<"visualize" | "ingest">("visualize");
+  const [isAgentInfoOpen, setIsAgentInfoOpen] = useState(false);
 
   // Chat State
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
@@ -53,14 +48,20 @@ export default function App() {
   
   // Custom states
   const [selectedNode, setSelectedNode] = useState<KnowledgeNode | null>(null);
-  const [graphLoading, setGraphLoading] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
 
   // Chat scroll container
+  const chatScrollRef = useRef<HTMLDivElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const scrollContainer = chatScrollRef.current;
+    if (!scrollContainer) return;
+
+    scrollContainer.scrollTo({
+      top: scrollContainer.scrollHeight,
+      behavior: chatMessages.length > 1 || isChatLoading ? "smooth" : "auto",
+    });
   }, [chatMessages, isChatLoading]);
 
   // Set default selected node for display details
@@ -96,9 +97,6 @@ export default function App() {
       }));
 
       const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (localApiKey) {
-        headers["Authorization"] = `Bearer ${localApiKey}`;
-      }
 
       const response = await fetch("/api/chat", {
         method: "POST",
@@ -109,8 +107,8 @@ export default function App() {
       const data = await response.json();
 
       if (!response.ok) {
-        if (data.needsApiKey) {
-          throw new Error("Sila pasangkan API key anda bagi Gemini API di panel Secrets dalam Google AI Studio!");
+        if (data.needsAdc) {
+          throw new Error("Konfigurasi ADC / Vertex AI belum lengkap untuk akaun perkhidmatan Cloud Run.");
         }
         throw new Error(data.error || "Gagal menghubungi ejen Syariah.");
       }
@@ -198,15 +196,6 @@ export default function App() {
     }
   }, [successNotice]);
 
-  // Handle graph parse outcome
-  const handleGraphExtracted = (newNodes: KnowledgeNode[], newLinks: KnowledgeLink[]) => {
-    setNodes(newNodes);
-    setLinks(newLinks);
-    if (newNodes.length > 0) {
-      setSelectedNode(newNodes[0]);
-    }
-  };
-
   return (
     <div className="min-h-screen bg-[#FDFBF7] text-[#3D3B36] font-sans islamic-grid antialiased selection:bg-[#5A634A]/20 flex flex-col">
       
@@ -239,17 +228,10 @@ export default function App() {
               SUMBER BERSEPADU: <span className="text-[#A48F68] font-bold">10 PORTAL RASMI</span>
             </span>
             <div className="flex items-center gap-1.5 bg-[#EAE7DF]/60 border border-[#D4D0C6] px-3 py-1 rounded-full shadow-inner">
-              <Key className="w-3 h-3 text-[#5A634A]" />
-              <input
-                type="password"
-                placeholder="Gemini API Key..."
-                value={localApiKey}
-                onChange={(e) => {
-                  setLocalApiKey(e.target.value);
-                  localStorage.setItem("mursyid_gemini_api_key", e.target.value);
-                }}
-                className="bg-transparent border-none text-[10px] text-[#2D2B26] focus:outline-none w-28 placeholder:text-[#8A8478]/70 font-sans"
-              />
+              <Lock className="w-3 h-3 text-[#5A634A]" />
+              <span className="text-[10px] font-sans font-semibold text-[#6D685E]">
+                GEMINI: <span className="text-[#5A634A] font-bold">ADC</span>
+              </span>
             </div>
           </div>
         </div>
@@ -309,14 +291,14 @@ export default function App() {
           </button>
         </div>
 
-        {/* Global Key warning if api key missing from server environment */}
-        {!process.env.GEMINI_API_KEY && chatError?.includes("Secrets") && (
+        {/* Global warning if ADC / Vertex AI is not configured */}
+        {chatError?.includes("ADC") && (
           <div className="p-4 rounded-xl border border-amber-950 bg-amber-950/15 text-amber-300 flex items-start gap-4">
             <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
             <div className="text-xs text-left leading-relaxed space-y-1">
-              <h4 className="font-semibold text-amber-200">Ketiadaan Kunci API Gemini (Secret Key Missing)</h4>
+              <h4 className="font-semibold text-amber-200">Konfigurasi ADC / Vertex AI Diperlukan</h4>
               <p>
-                Sistem mengesan kunci <strong>GEMINI_API_KEY</strong> belum ditetapkan dalam profil AI Studio anda. Sila tambah kunci rahsia anda di bawah bahagian <strong>Settings &gt; Secrets</strong> di sidebar kiri atau tetingkap panel AI Studio untuk memulakan integrasi ejen pintar secara langsung.
+                Sistem menggunakan Application Default Credentials melalui akaun perkhidmatan Cloud Run. Pastikan projek, lokasi Gemini, dan akses Vertex AI telah dikonfigurasikan.
               </p>
             </div>
           </div>
@@ -348,7 +330,7 @@ export default function App() {
         {/* Dynamic Tab Panel Stage with motion animations (compliant with framework rules) */}
         <div className="flex-1 bg-white rounded-2xl border border-[#E5E1D8] min-h-[500px] p-4 sm:p-6 overflow-hidden relative shadow-sm">
           
-          <AnimatePresence mode="wait">
+          <>
             
             {/* TAB 1: Chat Companion (Halaqah Fiqh) */}
             {activeTab === "chat" && (
@@ -362,30 +344,44 @@ export default function App() {
               >
                 {/* Side presets & resource instructions */}
                 <div className="lg:col-span-1 space-y-4 text-left">
-                  <div className="p-4 rounded-xl bg-[#F9F7F2] border border-[#E5E1D8] space-y-3">
-                    <h4 className="font-serif text-xs font-semibold uppercase tracking-wider text-[#5A634A] flex items-center gap-1.5">
-                      <Brain className="w-3.5 h-3.5 text-[#5A634A]" />
-                      Arahan Ejen Fiqh
-                    </h4>
-                    <p className="text-[11px] text-[#5A564E] leading-relaxed">
-                      Kecerdasan Buatan menggunakan model <strong>Gemini 3.5-Flash</strong> bersepadu dengan 
-                      <strong> Google Search Grounding</strong>. Jawapan yang dihasilkan dipautkan terus kepada data web dari 10 domain rujukan yang diiktiraf.
-                    </p>
-                    <div className="border-t border-[#E5E1D8] pt-2.5 space-y-1.5">
-                      <span className="text-[10px] text-[#8A8478] font-bold uppercase block">Spesifikasi Mazhab:</span>
-                      <span className="text-[11px] text-[#3D3B36] block bg-[#EAE7DF] px-2 py-1 rounded border border-[#D4D0C6]">
-                        • Imam Al-Shafi'i (Utama)
+                  <div className="rounded-lg bg-[#F7F4ED] px-3 py-2 shadow-sm ring-1 ring-[#E5E1D8]">
+                    <button
+                      type="button"
+                      onClick={() => setIsAgentInfoOpen((open) => !open)}
+                      className="flex w-full items-center justify-between gap-3 text-left text-xs font-semibold text-[#4D5F49] cursor-pointer"
+                      aria-expanded={isAgentInfoOpen}
+                    >
+                      <span className="flex items-center gap-2">
+                        <HelpCircle className="w-4 h-4 text-[#0F766E]" />
+                        Arahan Ejen Fiqh
                       </span>
-                      <span className="text-[11px] text-[#3D3B36] block bg-[#EAE7DF] px-2 py-1 rounded border border-[#D4D0C6]">
-                        • Penyelarasan Adab Melayu
+                      <span className="text-[11px] text-[#8A8478]">
+                        {isAgentInfoOpen ? "Tutup" : "Info"}
                       </span>
-                    </div>
+                    </button>
+
+                    {isAgentInfoOpen && (
+                      <div className="mt-3 space-y-3 border-t border-[#E5E1D8] pt-3">
+                        <p className="text-[12px] text-[#5A564E] leading-relaxed">
+                          Kecerdasan Buatan menggunakan model <strong>Gemini 3.5-Flash</strong> bersepadu dengan
+                          <strong> Google Search Grounding</strong>. Jawapan dipautkan kepada 10 domain rujukan rasmi.
+                        </p>
+                        <div className="flex flex-wrap gap-1.5">
+                          <span className="text-[11px] text-[#3D3B36] bg-white px-2 py-1 rounded-full ring-1 ring-[#E5E1D8]">
+                            Imam Al-Shafi'i
+                          </span>
+                          <span className="text-[11px] text-[#3D3B36] bg-white px-2 py-1 rounded-full ring-1 ring-[#E5E1D8]">
+                            Adab Melayu
+                          </span>
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   {/* Preset Questions selection */}
                   <div className="space-y-2">
-                    <span className="text-[11px] uppercase tracking-wider font-semibold text-[#6D685E] font-serif block">
-                      Cadangan Persoalan Hukum:
+                    <span className="text-[12px] font-semibold text-[#4F4A43] block">
+                      Cadangan Persoalan Hukum
                     </span>
                     <div className="flex flex-col gap-2">
                       {PRESET_QUESTIONS.map((pq, idx) => (
@@ -393,15 +389,14 @@ export default function App() {
                           key={idx}
                           onClick={() => handleSendMessage(pq.question)}
                           disabled={isChatLoading}
-                          className="p-3 text-left bg-[#F9F7F2] border border-[#E5E1D8] hover:border-[#5A634A] rounded-lg text-xs hover:bg-[#EAE7DF]/40 transition-all text-[#3D3B36] hover:text-[#5A634A] space-y-1.5 cursor-pointer"
+                          className="group rounded-2xl bg-[#F7F4ED] px-3 py-2.5 text-left text-xs text-[#3D3B36] shadow-sm ring-1 ring-[#E5E1D8] transition-colors hover:bg-white hover:ring-[#0F766E]/45 disabled:cursor-not-allowed disabled:opacity-60 cursor-pointer"
                         >
-                          <div className="flex items-center justify-between">
-                            <span className="text-[10px] text-[#A48F68] font-semibold px-1.5 py-0.5 rounded bg-[#EAE7DF] border border-[#D4D0C6]">
+                          <div className="mb-1.5 flex items-center gap-2">
+                            <span className="rounded-full bg-[#E5F2EE] px-2 py-0.5 text-[10px] font-semibold text-[#0F766E]">
                               {pq.category}
                             </span>
-                            <span className="text-[9px] font-mono text-[#8A8478] font-semibold uppercase">PILIH ➔</span>
                           </div>
-                          <p className="line-clamp-2 leading-relaxed text-[11px] text-[#5A564E] group-hover:text-[#3D3B36]">
+                          <p className="line-clamp-2 text-[12px] leading-relaxed text-[#5A564E] group-hover:text-[#2D2B26]">
                             {pq.question}
                           </p>
                         </button>
@@ -411,10 +406,10 @@ export default function App() {
                 </div>
 
                 {/* Central Chat panel */}
-                <div className="lg:col-span-3 flex flex-col h-[520px] bg-white border border-[#E5E1D8] rounded-xl overflow-hidden shadow-sm">
+                <div className="lg:col-span-3 flex flex-col h-[620px] bg-white rounded-xl overflow-hidden shadow-sm ring-1 ring-[#E5E1D8]">
                   
                   {/* Messages Scroll Area */}
-                  <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar bg-[#F9F7F2]/40">
+                  <div ref={chatScrollRef} className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar bg-[#F9F7F2]/40">
                     <AnimatePresence initial={false}>
                       {chatMessages.map((msg) => (
                         <div
@@ -424,16 +419,16 @@ export default function App() {
                           }`}
                         >
                           <div
-                            className={`max-w-[85%] rounded-2xl p-4 text-xs text-left leading-relaxed ${
+                            className={`max-w-[88%] rounded-2xl p-4 text-left leading-relaxed ${
                               msg.role === "user"
-                                ? "bg-[#5A634A] text-white rounded-br-none shadow-sm"
+                                ? "bg-[#2F6F63] text-white rounded-br-none shadow-sm"
                                 : msg.role === "system"
                                 ? "bg-rose-50 border border-rose-200 text-rose-700 rounded-bl-none"
                                 : "bg-white border border-[#E5E1D8] text-[#3D3B36] rounded-bl-none shadow-sm"
                             }`}
                           >
                             {/* Role label & timestamp */}
-                            <div className={`flex items-center justify-between gap-6 mb-1 text-[10px] font-semibold ${msg.role === "user" ? "text-emerald-100" : "text-[#8A8478]"}`}>
+                            <div className={`flex items-center justify-between gap-6 mb-2 text-[10px] font-semibold ${msg.role === "user" ? "text-emerald-50" : "text-[#8A8478]"}`}>
                               <span className="font-serif uppercase">
                                 {msg.role === "user" ? "SAYA" : msg.role === "system" ? "PENGGERA SISTEM" : "EJEN ALIM PERUNDANGAN"}
                               </span>
@@ -443,7 +438,13 @@ export default function App() {
                             </div>
 
                             {/* Main content body */}
-                            <p className="whitespace-pre-wrap">{msg.content}</p>
+                            {msg.role === "user" ? (
+                              <p className="whitespace-pre-wrap text-sm leading-6 text-white/95">
+                                {msg.content}
+                              </p>
+                            ) : (
+                              <ChatMarkdownRenderer content={msg.content} />
+                            )}
 
                             {/* Citations/Links block (Grounding display - explicit, no bloat) */}
                             {msg.citations && msg.citations.length > 0 && (
@@ -504,13 +505,13 @@ export default function App() {
                       value={userInput}
                       onChange={(e) => setUserInput(e.target.value)}
                       placeholder="Tulis soalan Syariah anda di sini (cthnya: Apakah rujukan hukum melabur emas secara ansuran?)..."
-                      className="flex-1 px-3 py-2.5 rounded-lg border border-[#E5E1D8] bg-white text-xs text-[#3D3B36] focus:outline-none focus:ring-1 focus:ring-[#5A634A] focus:border-[#5A634A] selection:bg-[#5A634A]/20"
+                      className="flex-1 px-3 py-3 rounded-lg border border-[#E5E1D8] bg-white text-sm text-[#3D3B36] focus:outline-none focus:ring-2 focus:ring-[#0F766E]/25 focus:border-[#0F766E] selection:bg-[#0F766E]/20"
                       disabled={isChatLoading}
                     />
                     <button
                       type="submit"
                       disabled={isChatLoading || !userInput.trim()}
-                      className="p-2.5 rounded-lg bg-[#5A634A] hover:bg-[#5A634A]/90 disabled:bg-[#EAE7DF] disabled:text-[#8A8478] text-[#FDFBF7] transition-all cursor-pointer shadow-sm flex items-center justify-center shrink-0"
+                      className="p-3 rounded-lg bg-[#0F766E] hover:bg-[#0B615A] disabled:bg-[#EAE7DF] disabled:text-[#8A8478] text-[#FDFBF7] transition-colors cursor-pointer shadow-sm flex items-center justify-center shrink-0"
                     >
                       <Send className="w-4 h-4" />
                     </button>
@@ -529,140 +530,169 @@ export default function App() {
                 transition={{ duration: 0.2 }}
                 className="space-y-6"
               >
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                {/* Inner sub-tab navigation header */}
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-[#E5E1D8] pb-4 text-left">
+                  <div>
+                    <h3 className="font-serif text-lg font-bold text-[#2D2B26]">
+                      Graf Pengetahuan Syariah
+                    </h3>
+                    <p className="text-xs text-[#8A8478]">
+                      Teroka visualisasi ontologi fiqh atau imbas portal rasmi untuk mengemas kini graf.
+                    </p>
+                  </div>
                   
-                  {/* Left component: Interactive Graph Canvas (Takes 2 span cols) */}
-                  <div className="lg:col-span-2 space-y-4">
-                    <div className="flex items-center justify-between">
-                      <div className="text-left">
-                        <h4 className="font-serif font-semibold text-[#2D2B26] flex items-center gap-1.5">
-                          <Network className="w-4.5 h-4.5 text-[#5A634A]" />
-                          Kanvas Graf Pengetahuan Fiqh Kontemporari (D3)
-                        </h4>
-                        <p className="text-[11px] text-[#8A8478]">
-                          Sila heret nod untuk menyusun, gunakan tatal tetikus untuk fungsi zoom, dan klik nod untuk memaparkan ulasan ontology.
-                        </p>
+                  <div className="flex p-0.5 rounded-lg bg-[#F1F0EC] border border-[#D4D0C6] self-start md:self-auto shrink-0 shadow-sm">
+                    <button
+                      onClick={() => setGraphSubTab("visualize")}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-bold tracking-wide transition-all cursor-pointer ${
+                        graphSubTab === "visualize"
+                          ? "bg-white text-[#5A634A] shadow-sm ring-1 ring-[#D4D0C6]/50 font-extrabold"
+                          : "text-[#6D685E] hover:text-[#5A634A]"
+                      }`}
+                    >
+                      <Network className="w-3.5 h-3.5 shrink-0" />
+                      Teroka Graf
+                    </button>
+                    <button
+                      onClick={() => setGraphSubTab("ingest")}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-bold tracking-wide transition-all cursor-pointer ${
+                        graphSubTab === "ingest"
+                          ? "bg-white text-[#5A634A] shadow-sm ring-1 ring-[#D4D0C6]/50 font-extrabold"
+                          : "text-[#6D685E] hover:text-[#5A634A]"
+                      }`}
+                    >
+                      <Globe className="w-3.5 h-3.5 shrink-0" />
+                      Imbas Portal
+                    </button>
+                  </div>
+                </div>
+
+                <>
+                  {/* SUB-TAB 1: Visualize / Explore Ontologi */}
+                  {graphSubTab === "visualize" && (
+                    <motion.div
+                      key="subtab-visualize"
+                      initial={{ opacity: 0, y: 5 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -5 }}
+                      transition={{ duration: 0.15 }}
+                      className="grid grid-cols-1 lg:grid-cols-3 gap-6"
+                    >
+                      {/* Left component: Interactive Graph Canvas (Takes 2 span cols) */}
+                      <div className="lg:col-span-2 space-y-4">
+                        <div className="flex items-center justify-between">
+                          <div className="text-left">
+                            <h4 className="font-serif font-semibold text-[#2D2B26] flex items-center gap-1.5">
+                              Visualisasi Graf (D3)
+                            </h4>
+                            <p className="text-[11px] text-[#8A8478]">
+                              Susun nod dengan mengheret, skrol untuk zoom, klik nod untuk maklumat lanjut.
+                            </p>
+                          </div>
+                        </div>
+
+                        <KnowledgeGraph
+                          nodes={nodes}
+                          links={links}
+                          onNodeSelect={(node) => setSelectedNode(node)}
+                          selectedNodeId={selectedNode?.id}
+                          onResetGraph={handleResetGraph}
+                        />
                       </div>
 
-                      {/* Reset back to pristine default */}
-                      <button
-                        onClick={handleResetGraph}
-                        className="px-3 py-1.5 rounded bg-[#F9F7F2] hover:bg-[#EAE7DF] border border-[#D4D0C6] text-[10px] text-[#5A634A] hover:text-[#2D2B26] flex items-center gap-1 transition-all cursor-pointer shadow-sm"
-                        title="Kembalikan format asal"
-                      >
-                        <RotateCcw className="w-3 h-3" />
-                        Kembalikan Asal
-                      </button>
-                    </div>
+                      {/* Right side details panels */}
+                      <div className="space-y-4 text-left">
+                        <div>
+                          <h4 className="font-serif font-semibold text-[#2D2B26] mb-3 block">
+                            Maklumat Entiti
+                          </h4>
+                          
+                          <AnimatePresence mode="wait">
+                            {selectedNode ? (
+                              <motion.div
+                                key={selectedNode.id}
+                                initial={{ opacity: 0, x: 10 }}
+                                animate={{ opacity: 1, x: 0 }}
+                                exit={{ opacity: 0, x: -10 }}
+                                className="rounded-xl bg-[#F9F7F2]/80 p-5 shadow-sm ring-1 ring-[#E5E1D8] space-y-5"
+                              >
+                                <div className="space-y-3">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="rounded-full bg-[#E5F2EE] px-2.5 py-1 text-[10px] font-bold text-[#0F766E]">
+                                      {selectedNode.type === "Artikkel" ? "Artikel" : selectedNode.type}
+                                    </span>
+                                    <span className="rounded-full bg-white px-2.5 py-1 text-[10px] font-mono font-semibold text-[#6D685E] ring-1 ring-[#E5E1D8]">
+                                      #{selectedNode.id.replace(/_/g, "-").toLowerCase()}
+                                    </span>
+                                  </div>
+                                  <h5 className="font-serif font-bold text-[#2D2B26] text-lg leading-snug">
+                                    {selectedNode.label}
+                                  </h5>
+                                </div>
 
-                    <KnowledgeGraph
-                      nodes={nodes}
-                      links={links}
-                      onNodeSelect={(node) => setSelectedNode(node)}
-                      selectedNodeId={selectedNode?.id}
-                    />
-                  </div>
+                                <div className="space-y-4 text-sm">
+                                  <div className="grid grid-cols-[88px_1fr] gap-3">
+                                    <span className="text-[11px] font-semibold text-[#8A8478]">Kategori</span>
+                                    <span className="text-[#3D3B36]">
+                                      {selectedNode.type === "Artikkel" ? "Artikel" : selectedNode.type}
+                                    </span>
+                                  </div>
+                                  <div className="grid grid-cols-[88px_1fr] gap-3">
+                                    <span className="text-[11px] font-semibold text-[#8A8478]">Ringkasan</span>
+                                    <p className="text-[#5A564E] leading-6">
+                                      {selectedNode.description}
+                                    </p>
+                                  </div>
+                                  <div className="grid grid-cols-[88px_1fr] gap-3">
+                                    <span className="text-[11px] font-semibold text-[#8A8478]">Rujukan</span>
+                                    <p className="text-[#5A564E] leading-6">
+                                      Bersandar kepada hubungan langsung dalam graf semasa.
+                                    </p>
+                                  </div>
+                                </div>
 
-                  {/* Right side details panels */}
-                  <div className="space-y-4 text-left">
-                    <div>
-                      <h4 className="font-serif font-semibold text-[#2D2B26] mb-3 block">
-                        Detail Maklumat Ontologi
-                      </h4>
-                      
-                      <AnimatePresence mode="wait">
-                        {selectedNode ? (
-                          <motion.div
-                            key={selectedNode.id}
-                            initial={{ opacity: 0, x: 10 }}
-                            animate={{ opacity: 1, x: 0 }}
-                            exit={{ opacity: 0, x: -10 }}
-                            className="p-5 rounded-xl border border-[#E5E1D8] bg-[#F9F7F2]/60 space-y-4 shadow-sm"
-                          >
-                            <div className="flex items-center justify-between gap-2 border-b border-[#E5E1D8] pb-3">
-                              <div>
-                                <span className="inline-block px-2 py-0.5 rounded bg-[#EAE7DF] border border-[#D4D0C6] text-[9px] uppercase font-sans font-bold text-[#5A634A]">
-                                  {selectedNode.type}
-                                </span>
-                                <h5 className="font-serif font-bold text-[#2D2B26] text-lg mt-1">
-                                  {selectedNode.label}
-                                </h5>
+                                <div className="rounded-lg bg-white/75 px-3 py-2 text-[12px] leading-5 text-[#5A564E] ring-1 ring-[#E5E1D8]">
+                                  Kesan rujukan syarak akan berubah mengikut nod yang bersambung dengan entiti ini.
+                                </div>
+                              </motion.div>
+                            ) : (
+                              <div className="p-5 rounded-xl border border-[#E5E1D8] bg-[#F9F7F2]/30 text-[#8A8478] text-xs">
+                                Klik nod di sebelah kiri untuk melihat penerangan hukum Syariah.
                               </div>
-                              <span className="text-[10px] font-mono text-[#8A8478] font-bold uppercase shrink-0">
-                                #{selectedNode.id.toUpperCase()}
-                              </span>
-                            </div>
+                            )}
+                          </AnimatePresence>
+                        </div>
 
-                            <p className="text-xs text-[#5A564E] leading-relaxed bg-white p-3 rounded-lg border border-[#E5E1D8] font-sans">
-                              {selectedNode.description}
-                            </p>
+                        <div className="p-4 rounded-xl border border-[#D4D0C6] bg-[#EAE7DF]/70 space-y-2">
+                          <h5 className="text-xs font-bold text-[#5A634A] flex items-center gap-1 font-serif">
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            Kelebihan Graf
+                          </h5>
+                          <p className="text-[10px] text-[#5A564E] leading-relaxed">
+                            Sistem menyusuri hujah mazhab setempat secara formal bagi menjamin kesahihan keputusan tanpa mencampurkan data rawak luar.
+                          </p>
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
 
-                            <div className="space-y-1 text-[11px] text-[#5A564E]">
-                              <span className="font-semibold text-[#8A8478] uppercase text-[9px] block">Rantai Keputusan Hukum terkait:</span>
-                              <p className="bg-[#FDFBF7] p-2 rounded border border-[#E5E1D8]">
-                                Sebarang perubahan pada nod ini memberi kesan bergilir (cascade effect) kepada entiti rujukan syarak yang bersandar kepadanya secara langsung.
-                              </p>
-                            </div>
-                          </motion.div>
-                        ) : (
-                          <div className="p-5 rounded-xl border border-[#E5E1D8] bg-[#F9F7F2]/30 text-[#8A8478] text-xs">
-                            Sila klik mana-mana nod di sebelah kiri untuk melihat penerangan hukum Syariah yang kaya konteks.
-                          </div>
-                        )}
-                      </AnimatePresence>
-                    </div>
-
-                    <div className="p-4 rounded-xl border border-[#D4D0C6] bg-[#EAE7DF]/70 space-y-2.5">
-                      <h5 className="text-xs font-bold text-[#5A634A] flex items-center gap-1 font-serif">
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        Mengapa Tiada Kehilangan Konteks?
-                      </h5>
-                      <p className="text-[10px] text-[#5A564E] leading-relaxed">
-                        Graf Pengetahun memelihara peta hubungan teologi secara formal. Melalui kaedah ini, enjin carian menyusuri garis lurus rukun Syariah, mengikut hujah mazhab setempat tanpa mencampurkan data rawak yang boleh mengelirukan kesahihan perundangan.
-                      </p>
-                    </div>
-                  </div>
-
-                </div>
-
-                {/* Crawler and Batch Indexer Panel */}
-                <div className="border-t border-[#E5E1D8] pt-6 pb-2">
-                  <div className="text-left mb-4">
-                    <h4 className="font-serif font-semibold text-[#2D2B26] flex items-center gap-1.5">
-                      <Globe className="w-4.5 h-4.5 text-[#5A634A]" />
-                      Sistem Perayap Laman Web & Saluran Ingestasi (Knowledge Graph Ingestion)
-                    </h4>
-                    <p className="text-[11px] text-[#8A8478]">
-                      Gunakan enjin ini untuk merayap dan mengindeks kandungan fatwa kontemporari secara real-time dari pangkalan web rasmi agensi Malaysia.
-                    </p>
-                  </div>
-
-                  <CrawlerPanel
-                    apiKey={localApiKey}
-                    onIndexComplete={refreshGraph}
-                    setError={setGlobalError}
-                  />
-                </div>
-
-                {/* Parser Simulator panel at the bottom for interaction */}
-                <div className="border-t border-[#E5E1D8] pt-6">
-                  <div className="text-left mb-4">
-                    <h4 className="font-serif font-semibold text-[#2D2B26] flex items-center gap-1.5">
-                      <Sparkles className="w-4.5 h-4.5 text-[#5A634A]" />
-                      Pembina Graf Pengetahuan Fiqh Kontemporari (Ekstraktor AI)
-                    </h4>
-                    <p className="text-[11px] text-[#8A8478]">
-                      Bahagian simulasi ini menterjemahkan teks fatwa atau kemusykilan am di Malaysia ke bentuk struktur nod visual dalam sekelip mata.
-                    </p>
-                  </div>
-
-                  <ParserSimulator
-                    onGraphExtracted={handleGraphExtracted}
-                    isLoading={graphLoading}
-                    setIsLoading={setGraphLoading}
-                    setError={setGlobalError}
-                  />
-                </div>
+                  {/* SUB-TAB 2: Web Ingestor & Crawler */}
+                  {graphSubTab === "ingest" && (
+                    <motion.div
+                      key="subtab-ingest"
+                      initial={{ opacity: 0, y: 5 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -5 }}
+                      transition={{ duration: 0.15 }}
+                      className="space-y-6"
+                    >
+                      <CrawlerPanel
+                        onIndexComplete={refreshGraph}
+                        setError={setGlobalError}
+                      />
+                    </motion.div>
+                  )}
+                </>
               </motion.div>
             )}
 
@@ -709,7 +739,7 @@ export default function App() {
               </motion.div>
             )}
 
-          </AnimatePresence>
+          </>
 
         </div>
         

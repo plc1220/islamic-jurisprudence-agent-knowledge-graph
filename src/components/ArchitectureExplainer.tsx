@@ -125,9 +125,9 @@ export function ArchitectureExplainer() {
           <div className="flex items-center gap-3">
             <Database className="w-8 h-8 text-[#5A634A] shrink-0" />
             <div className="text-left">
-              <h5 className="text-xs font-bold text-[#2D2B26] font-serif">Saranan Pangkalan Data: Neo4j Graph + PostgreSQL (Hybrid)</h5>
+              <h5 className="text-xs font-bold text-[#2D2B26] font-serif">Pangkalan Pengetahuan: BigQuery + Knowledge Catalog</h5>
               <p className="text-[10px] text-[#5A564E] leading-relaxed">
-                Platform Neo4j menyimpan struktur hubungan graf, manakala PostgreSQL menampung arkib teks dokumen fatwa asal.
+                BigQuery menyimpan dokumen, embedding, dan hubungan graf; Knowledge Catalog menerbitkan metadata sumber terkawal.
               </p>
             </div>
           </div>

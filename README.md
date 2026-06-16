@@ -15,6 +15,8 @@ View your app in AI Studio: https://ai.studio/apps/de4a7270-9e60-40de-aa49-bafc0
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
+2. Authenticate with Google Cloud ADC:
+   `gcloud auth application-default login`
+3. Set `GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_GENAI_USE_ENTERPRISE=true`, and `GOOGLE_GENAI_USE_VERTEXAI=true` in your local env
+4. Run the app:
    `npm run dev`

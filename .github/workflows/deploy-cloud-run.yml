@@ -1,0 +1,93 @@
+name: Deploy Cloud Run
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID || 'my-rd-coe-demo-gen-ai' }}
+  REGION: ${{ vars.GCP_REGION || 'asia-southeast1' }}
+  REPOSITORY: ${{ vars.ARTIFACT_REGISTRY_REPOSITORY || 'mursyid-repo' }}
+  SERVICE_NAME: ${{ vars.CLOUD_RUN_SERVICE || 'mursyid-ai' }}
+  GCP_LOCATION: ${{ vars.GCP_LOCATION || 'asia-southeast1' }}
+  GEMINI_LOCATION: ${{ vars.GEMINI_LOCATION || 'global' }}
+  BQ_DATASET: ${{ vars.BQ_DATASET || 'mursyid_knowledge' }}
+  BQ_CORPUS_TABLE: ${{ vars.BQ_CORPUS_TABLE || 'corpus' }}
+  BQ_CHUNKS_TABLE: ${{ vars.BQ_CHUNKS_TABLE || 'chunks' }}
+  BQ_GRAPH_TABLE: ${{ vars.BQ_GRAPH_TABLE || 'graph_edges' }}
+  BQ_EMBEDDING_MODEL: ${{ vars.BQ_EMBEDDING_MODEL || 'text-embedding-004' }}
+  GCS_RAW_BUCKET: ${{ vars.GCS_RAW_BUCKET || 'my-rd-coe-demo-gen-ai-mursyid-raw' }}
+  KNOWLEDGE_CATALOG_ENTRY_GROUP: ${{ vars.KNOWLEDGE_CATALOG_ENTRY_GROUP || 'mursyid-knowledge' }}
+  KNOWLEDGE_CATALOG_ENTRY_TYPE: ${{ vars.KNOWLEDGE_CATALOG_ENTRY_TYPE || 'mursyid-knowledge-entry' }}
+  KNOWLEDGE_CATALOG_ASPECT_TYPE: ${{ vars.KNOWLEDGE_CATALOG_ASPECT_TYPE || 'mursyid-context' }}
+  CRAWL_MAX_DEPTH: ${{ vars.CRAWL_MAX_DEPTH || '1' }}
+  CRAWL_MAX_PAGES_PER_SOURCE: ${{ vars.CRAWL_MAX_PAGES_PER_SOURCE || '3' }}
+  CRAWL4AI_TIMEOUT_MS: ${{ vars.CRAWL4AI_TIMEOUT_MS || '180000' }}
+
+jobs:
+  deploy:
+    name: Build, push, and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Artifact Registry auth
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
+            ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${SERVICE_NAME}" \
+            --project="${PROJECT_ID}" \
+            --image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${SERVICE_NAME}:${GITHUB_SHA}" \
+            --region="${REGION}" \
+            --platform=managed \
+            --allow-unauthenticated \
+            --service-account="mursyid-runtime@${PROJECT_ID}.iam.gserviceaccount.com" \
+            --port=3000 \
+            --memory=4Gi \
+            --cpu=2 \
+            --max-instances=1 \
+            --no-cpu-throttling \
+            --timeout=900 \
+            --remove-secrets=GEMINI_API_KEY \
+            --set-env-vars="NODE_ENV=production,CRAWLER_MODEL=gemini-3.1-flash-lite,CHAT_MODEL=gemini-3.5-flash,EXTRACTOR_MODEL=gemini-3.5-flash,GOOGLE_GENAI_USE_ENTERPRISE=true,GOOGLE_GENAI_USE_VERTEXAI=true,GCP_PROJECT_ID=${PROJECT_ID},GCP_LOCATION=${GCP_LOCATION},GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GEMINI_LOCATION=${GEMINI_LOCATION},GOOGLE_CLOUD_LOCATION=${GEMINI_LOCATION},INGESTION_CRAWLER=crawl4ai,CRAWL_MAX_DEPTH=${CRAWL_MAX_DEPTH},CRAWL_MAX_PAGES_PER_SOURCE=${CRAWL_MAX_PAGES_PER_SOURCE},CRAWL4AI_TIMEOUT_MS=${CRAWL4AI_TIMEOUT_MS},BQ_DATASET=${BQ_DATASET},BQ_CORPUS_TABLE=${BQ_CORPUS_TABLE},BQ_CHUNKS_TABLE=${BQ_CHUNKS_TABLE},BQ_GRAPH_TABLE=${BQ_GRAPH_TABLE},BQ_EMBEDDING_MODEL=${BQ_EMBEDDING_MODEL},GCS_RAW_BUCKET=${GCS_RAW_BUCKET},KNOWLEDGE_CATALOG_ENTRY_GROUP=${KNOWLEDGE_CATALOG_ENTRY_GROUP},KNOWLEDGE_CATALOG_ENTRY_TYPE=${KNOWLEDGE_CATALOG_ENTRY_TYPE},KNOWLEDGE_CATALOG_ASPECT_TYPE=${KNOWLEDGE_CATALOG_ASPECT_TYPE},MDCODE_EXPORT_DIR=/tmp/catalog-export"
+
+      - name: Show service URL
+        run: |
+          gcloud run services describe "${SERVICE_NAME}" \
+            --project="${PROJECT_ID}" \
+            --region="${REGION}" \
+            --format='value(status.url)'

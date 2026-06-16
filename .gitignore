@@ -4,5 +4,13 @@ dist/
 coverage/
 .DS_Store
 *.log
+__pycache__/
+*.py[cod]
 .env*
 !.env.example
+.gstack/
+catalog-export/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan

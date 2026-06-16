@@ -1741,6 +1741,16 @@ app.post("/api/chat", async (req, res) => {
 	        console.error("Failed to compile GCP-native grounding context:", gcpErr.message);
 		      }
 		    }
+
+	    if (isGcpNativeConfigured() && !groundedContext) {
+	      return res.json({
+	        text:
+	          "Katalog pengetahuan Mursyid (BigQuery/Knowledge Catalog) tidak memulangkan konteks yang cukup relevan untuk soalan ini. " +
+	          "Saya tidak akan membuat kesimpulan hukum khusus atau mereka-reka rujukan di luar korpus yang telah diimbas. " +
+	          "Sila imbas portal rasmi berkaitan dahulu, kemudian tanya semula supaya jawapan boleh disandarkan kepada sumber yang mempunyai metadata dan sitasi.",
+	        citations: [],
+	      });
+	    }
 	
 	    // In-memory GraphRAG fallback for local/offline development.
 		    if (!groundedContext && keywords.length > 0) {

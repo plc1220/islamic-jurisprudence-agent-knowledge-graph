@@ -71,7 +71,7 @@ export default function App() {
     }
   }, [nodes]);
 
-  // Send message to Express chat endpoint with live web search grounding
+  // Send message to Express chat endpoint with BigQuery/Knowledge Catalog grounding
   const handleSendMessage = async (customText?: string) => {
     const textToSend = customText || userInput;
     if (!textToSend.trim() || isChatLoading) return;

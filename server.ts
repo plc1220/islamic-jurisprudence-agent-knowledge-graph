@@ -977,6 +977,34 @@ function chunkCitation(chunk: RetrievedChunk): Citation {
   };
 }
 
+function getTextKeywordMatches(text: string, keywords: string[]): string[] {
+  const normalized = text.toLowerCase();
+  return keywords.filter(keyword => normalized.includes(keyword.toLowerCase()));
+}
+
+function filterRelevantChunks(chunks: RetrievedChunk[], keywords: string[]): RetrievedChunk[] {
+  if (keywords.length === 0) return chunks;
+
+  return chunks.filter(chunk => {
+    const haystack = `${chunk.title || ""}\n${chunk.sourceUrl || ""}\n${chunk.content || ""}`;
+    const matches = getTextKeywordMatches(haystack, keywords);
+
+    // One highly specific term is enough; otherwise require more overlap so
+    // generic portal/navigation pages do not become false citations.
+    return matches.some(match => match.length >= 8) || matches.length >= 2;
+  });
+}
+
+function filterRelevantTriples(triples: RetrievedGraphTriple[], keywords: string[]): RetrievedGraphTriple[] {
+  if (keywords.length === 0) return triples;
+
+  return triples.filter(triple => {
+    const haystack = `${triple.title || ""}\n${triple.sourceUrl || ""}\n${triple.text || ""}`;
+    const matches = getTextKeywordMatches(haystack, keywords);
+    return matches.some(match => match.length >= 8) || matches.length >= 2;
+  });
+}
+
 async function searchBigQueryVectorChunks(ai: GoogleGenAI, message: string, limit: number = 3): Promise<RetrievedChunk[]> {
   if (!isGcpNativeConfigured()) return [];
 
@@ -1679,8 +1707,8 @@ app.post("/api/chat", async (req, res) => {
 		    if (isGcpNativeConfigured()) {
 	      try {
 	        console.log(`GCP Native Retrieval: BigQuery + Knowledge Catalog context search for: "${message}"`);
-		        const vectorChunks = await searchBigQueryVectorChunks(ai, message, 3);
-		        const graphTriples = await searchBigQueryGraphTriples(keywords);
+		        const vectorChunks = filterRelevantChunks(await searchBigQueryVectorChunks(ai, message, 5), keywords).slice(0, 3);
+		        const graphTriples = filterRelevantTriples(await searchBigQueryGraphTriples(keywords), keywords);
 
 		        if (vectorChunks.length > 0 || graphTriples.length > 0) {
 		          groundedContext += "\n\nMAKLUMAT SAHIH DARIPADA BIGQUERY VECTOR SEARCH & KNOWLEDGE CATALOG MURSYID AI:\n";
@@ -1722,7 +1750,7 @@ app.post("/api/chat", async (req, res) => {
 	    citations = dedupeCitations(citations);
 
 	    // Append our grounding context block directly into the Gemini instructions
-	    const finalSystemInstruction = systemInstruction + (groundedContext ? `\n\nSila berikan keutamaan tertinggi kepada data rujukan di bawah untuk menyusun hujah jawapan anda. Jangan gunakan carian web umum sebagai sumber utama; gunakan hanya konteks BigQuery Vector Search dan Knowledge Catalog/BigQuery Graph di bawah apabila tersedia. Apabila merujuk sumber, sebut nama portal/tajuk yang muncul dalam konteks.\n${groundedContext}` : "");
+	    const finalSystemInstruction = systemInstruction + (groundedContext ? `\n\nSila berikan keutamaan tertinggi kepada data rujukan di bawah untuk menyusun hujah jawapan anda. Jangan gunakan carian web umum sebagai sumber utama; gunakan hanya konteks BigQuery Vector Search dan Knowledge Catalog/BigQuery Graph di bawah apabila tersedia. Apabila merujuk sumber, sebut nama portal/tajuk yang muncul dalam konteks. Jika konteks tidak mengandungi jawapan khusus yang ditanya, nyatakan dengan jelas bahawa katalog pengetahuan Mursyid belum mempunyai rujukan mencukupi untuk isu tersebut dan jangan reka keputusan fatwa atau URL.\n${groundedContext}` : "\n\nKatalog pengetahuan BigQuery/Knowledge Catalog tidak memulangkan konteks yang cukup relevan untuk soalan ini. Jangan gunakan carian web umum. Jika menjawab, nyatakan batasan ini dengan jelas dan minta pengguna mengimbas portal rasmi berkaitan sebelum membuat kesimpulan hukum khusus.");
 
     const formattedHistory = (history || []).map((h: any) => ({
       role: h.role === "user" ? "user" : "model",

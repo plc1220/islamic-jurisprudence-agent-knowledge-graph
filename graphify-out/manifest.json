@@ -1,0 +1,21 @@
+{
+  "vite.config.ts": 1781964558.137481,
+  "server.ts": 1781970509.4048803,
+  "scripts/crawl4ai_bridge.py": 1781964558.1364064,
+  "src/data.ts": 1781964558.1372375,
+  "src/App.tsx": 1781972004.2745638,
+  "src/main.tsx": 1781964558.1373358,
+  "src/types.ts": 1781972007.2095783,
+  "src/components/RelevantGraphSnippet.tsx": 1781967086.8991368,
+  "src/components/CrawlerPanel.tsx": 1781970977.9600496,
+  "src/components/ArchitectureExplainer.tsx": 1781964558.1368039,
+  "src/components/ChatMarkdownRenderer.tsx": 1781964558.1369004,
+  "src/components/KnowledgeGraph.tsx": 1781970171.732325,
+  "src/components/SourceCard.tsx": 1781964558.1371613,
+  "index.html": 1781964558.1354957,
+  "requirements-crawler.txt": 1781964558.1363053,
+  "README.md": 1781964558.1335285,
+  "graphify-out/graph.html": 1781972022.623235,
+  "graphify-out/GRAPH_REPORT.md": 1781972012.3840313,
+  "doc/cicd.md": 1781964558.1337354
+}

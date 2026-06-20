@@ -109,6 +109,7 @@ gcloud builds submit \
 | `_BQ_CORPUS_TABLE` | `corpus` | Full crawled document table. |
 | `_BQ_CHUNKS_TABLE` | `chunks` | Chunk + embedding table used by vector search. |
 | `_BQ_GRAPH_TABLE` | `graph_edges` | Extracted graph edge table. |
+| `_BQ_CRAWL_RUNS_TABLE` | `crawl_runs` | Durable crawler run/pass records used by the status UI. |
 | `_GCS_RAW_BUCKET` | empty | Cloud Storage bucket for markdown snapshots; set this for production. |
 | `_KNOWLEDGE_CATALOG_ENTRY_GROUP` | `mursyid-knowledge` | Custom Knowledge Catalog entry group. |
 
@@ -117,9 +118,10 @@ gcloud builds submit \
 1. Crawl4AI returns clean markdown documents.
 2. Cloud Storage stores raw markdown snapshots when `GCS_RAW_BUCKET` is configured.
 3. BigQuery receives corpus rows, chunk embeddings, and extracted graph edges.
-4. BigQuery Vector Search retrieves grounded semantic chunks for `/api/chat`.
-5. Knowledge Catalog receives governed source and concept entries with custom aspects.
-6. A metadata-as-code export is written to `MDCODE_EXPORT_DIR` for review/debugging.
+4. BigQuery receives crawler run/pass records so `/api/crawl-logs` can recover status after restarts.
+5. BigQuery Vector Search retrieves grounded semantic chunks for `/api/chat`.
+6. Knowledge Catalog receives governed source and concept entries with custom aspects.
+7. A metadata-as-code export is written to `MDCODE_EXPORT_DIR` for review/debugging.
 
 ## Local ADC Setup
 

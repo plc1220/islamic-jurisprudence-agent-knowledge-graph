@@ -57,6 +57,12 @@ variable "bq_graph_table" {
   default     = "graph_edges"
 }
 
+variable "bq_crawl_runs_table" {
+  description = "BigQuery table for durable crawler run and pass records."
+  type        = string
+  default     = "crawl_runs"
+}
+
 variable "bq_embedding_model" {
   description = "Embedding model name recorded for BigQuery Vector Search rows."
   type        = string

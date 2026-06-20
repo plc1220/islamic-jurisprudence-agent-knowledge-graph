@@ -1,3 +1,9 @@
+export type AppTab = "chat" | "graph" | "sources" | "analytics" | "review";
+
+export type FeedbackRating = "up" | "down";
+export type FeedbackReviewStatus = "new" | "reviewing" | "resolved";
+export type FeedbackPipelineStatus = "none" | "queued" | "drafted" | "applied";
+
 export interface ChatMessage {
   id: string;
   role: "user" | "model" | "system";
@@ -47,10 +53,40 @@ export interface PresetQuestion {
 }
 
 export interface PersistedAppState {
-  activeTab?: "chat" | "graph" | "sources" | "engineering";
+  activeTab?: AppTab;
   graphSubTab?: "visualize" | "ingest";
   isAgentInfoOpen?: boolean;
   selectedNodeId?: string | null;
   userInput?: string;
   chatMessages?: ChatMessage[];
+}
+
+export interface FeedbackRecord {
+  id: string;
+  sessionId: string;
+  messageId: string;
+  rating: FeedbackRating;
+  question: string;
+  answer: string;
+  comment: string;
+  citations: {
+    title: string;
+    url: string;
+  }[];
+  reviewStatus: FeedbackReviewStatus;
+  reviewerNote: string;
+  pipelineStatus: FeedbackPipelineStatus;
+  improvementPlan?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FeedbackAnalytics {
+  total: number;
+  thumbsUp: number;
+  thumbsDown: number;
+  downRate: number;
+  newItems: number;
+  queuedImprovements: number;
+  draftedImprovements: number;
 }

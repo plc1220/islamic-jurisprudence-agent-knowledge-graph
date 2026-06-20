@@ -51,6 +51,7 @@ const BQ_DATASET = process.env.BQ_DATASET || "mursyid_knowledge";
 const BQ_CORPUS_TABLE = process.env.BQ_CORPUS_TABLE || "corpus";
 const BQ_CHUNKS_TABLE = process.env.BQ_CHUNKS_TABLE || "chunks";
 const BQ_GRAPH_TABLE = process.env.BQ_GRAPH_TABLE || "graph_edges";
+const BQ_CRAWL_RUNS_TABLE = process.env.BQ_CRAWL_RUNS_TABLE || "crawl_runs";
 const BQ_EMBEDDING_MODEL = process.env.BQ_EMBEDDING_MODEL || "text-embedding-004";
 const GCS_RAW_BUCKET = process.env.GCS_RAW_BUCKET || "";
 const KNOWLEDGE_CATALOG_ENTRY_GROUP = process.env.KNOWLEDGE_CATALOG_ENTRY_GROUP || "mursyid-knowledge";
@@ -59,6 +60,7 @@ const KNOWLEDGE_CATALOG_ASPECT_TYPE = process.env.KNOWLEDGE_CATALOG_ASPECT_TYPE 
 const MDCODE_EXPORT_DIR = process.env.MDCODE_EXPORT_DIR || path.join(process.cwd(), "catalog-export");
 const REDIS_URL = process.env.REDIS_URL || "";
 const SESSION_TTL_SECONDS = Math.max(300, parseInt(process.env.SESSION_TTL_SECONDS || "86400", 10));
+const FEEDBACK_STORE_PATH = process.env.FEEDBACK_STORE_PATH || path.join(process.cwd(), ".data", "review-feedback.jsonl");
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
@@ -180,6 +182,7 @@ type IngestStats = {
   gcsRawUris: string[];
 };
 type CrawlLog = {
+  runId?: string;
   sourceId?: number;
   sourceName?: string;
   url: string;
@@ -205,13 +208,32 @@ type SessionChatMessage = {
   relevantGraph?: GraphExtraction;
 };
 type PersistedSessionState = {
-  activeTab?: "chat" | "graph" | "sources" | "engineering";
+  activeTab?: "chat" | "graph" | "sources" | "analytics" | "review" | "engineering";
   graphSubTab?: "visualize" | "ingest";
   isAgentInfoOpen?: boolean;
   selectedNodeId?: string | null;
   userInput?: string;
   chatMessages?: SessionChatMessage[];
   updatedAt?: string;
+};
+type FeedbackRating = "up" | "down";
+type FeedbackReviewStatus = "new" | "reviewing" | "resolved";
+type FeedbackPipelineStatus = "none" | "queued" | "drafted" | "applied";
+type FeedbackRecord = {
+  id: string;
+  sessionId: string;
+  messageId: string;
+  rating: FeedbackRating;
+  question: string;
+  answer: string;
+  comment: string;
+  citations: { title: string; url: string }[];
+  reviewStatus: FeedbackReviewStatus;
+  reviewerNote: string;
+  pipelineStatus: FeedbackPipelineStatus;
+  improvementPlan?: string;
+  createdAt: string;
+  updatedAt: string;
 };
 
 function emptyRelevantGraph(): GraphExtraction {
@@ -246,7 +268,7 @@ const memorySessions = new Map<string, { state: PersistedSessionState; expiresAt
 let redisClient: ReturnType<typeof createClient> | null = null;
 let redisConnectPromise: Promise<void> | null = null;
 
-const validTabs = new Set(["chat", "graph", "sources", "engineering"]);
+const validTabs = new Set(["chat", "graph", "sources", "analytics", "review", "engineering"]);
 const validGraphSubTabs = new Set(["visualize", "ingest"]);
 
 function parseCookieHeader(header?: string): Record<string, string> {
@@ -458,6 +480,122 @@ async function writeSessionState(sessionId: string, state: PersistedSessionState
   return "memory";
 }
 
+// ==========================================
+// HUMAN FEEDBACK + REVIEW BENCH STORE
+// ==========================================
+let feedbackCache: FeedbackRecord[] | null = null;
+
+function ensureFeedbackStoreDir() {
+  fs.mkdirSync(path.dirname(FEEDBACK_STORE_PATH), { recursive: true });
+}
+
+function sanitizeFeedbackRating(value: any): FeedbackRating {
+  return value === "up" ? "up" : "down";
+}
+
+function sanitizeFeedbackReviewStatus(value: any): FeedbackReviewStatus | undefined {
+  return value === "new" || value === "reviewing" || value === "resolved" ? value : undefined;
+}
+
+function sanitizeFeedbackPipelineStatus(value: any): FeedbackPipelineStatus | undefined {
+  return value === "none" || value === "queued" || value === "drafted" || value === "applied" ? value : undefined;
+}
+
+function sanitizeFeedbackRecord(input: any, previous?: FeedbackRecord): FeedbackRecord {
+  const now = new Date().toISOString();
+  const citations = Array.isArray(input?.citations)
+    ? input.citations
+        .filter((citation: any) => citation && typeof citation.url === "string")
+        .slice(0, 20)
+        .map((citation: any) => ({
+          title: sanitizeText(citation.title, 240) || sanitizeText(citation.url, 240),
+          url: sanitizeText(citation.url, 1000),
+        }))
+    : previous?.citations || [];
+
+  return {
+    id: previous?.id || randomUUID(),
+    sessionId: sanitizeText(input?.sessionId, 120) || previous?.sessionId || "anonymous",
+    messageId: sanitizeText(input?.messageId, 120) || previous?.messageId || `message-${Date.now()}`,
+    rating: sanitizeFeedbackRating(input?.rating ?? previous?.rating),
+    question: sanitizeText(input?.question, 6000) || previous?.question || "",
+    answer: sanitizeText(input?.answer, 12000) || previous?.answer || "",
+    comment: sanitizeText(input?.comment, 4000) || previous?.comment || "",
+    citations,
+    reviewStatus: sanitizeFeedbackReviewStatus(input?.reviewStatus) || previous?.reviewStatus || "new",
+    reviewerNote: sanitizeText(input?.reviewerNote, 4000) || previous?.reviewerNote || "",
+    pipelineStatus: sanitizeFeedbackPipelineStatus(input?.pipelineStatus) || previous?.pipelineStatus || "none",
+    improvementPlan: sanitizeText(input?.improvementPlan, 6000) || previous?.improvementPlan,
+    createdAt: previous?.createdAt || now,
+    updatedAt: now,
+  };
+}
+
+function loadFeedbackRecords(): FeedbackRecord[] {
+  if (feedbackCache) return feedbackCache;
+
+  try {
+    if (!fs.existsSync(FEEDBACK_STORE_PATH)) {
+      feedbackCache = [];
+      return feedbackCache;
+    }
+
+    feedbackCache = fs
+      .readFileSync(FEEDBACK_STORE_PATH, "utf8")
+      .split("\n")
+      .map(line => line.trim())
+      .filter(Boolean)
+      .map(line => {
+        try {
+          return sanitizeFeedbackRecord(JSON.parse(line));
+        } catch {
+          return null;
+        }
+      })
+      .filter((record): record is FeedbackRecord => Boolean(record));
+    return feedbackCache;
+  } catch (err: any) {
+    console.error("Feedback store read failed:", err.message);
+    feedbackCache = [];
+    return feedbackCache;
+  }
+}
+
+function saveFeedbackRecords(records: FeedbackRecord[]) {
+  ensureFeedbackStoreDir();
+  feedbackCache = records;
+  fs.writeFileSync(FEEDBACK_STORE_PATH, records.map(record => JSON.stringify(record)).join("\n") + (records.length ? "\n" : ""));
+}
+
+function getFeedbackAnalytics(records: FeedbackRecord[]) {
+  const thumbsUp = records.filter(record => record.rating === "up").length;
+  const thumbsDown = records.filter(record => record.rating === "down").length;
+  return {
+    total: records.length,
+    thumbsUp,
+    thumbsDown,
+    downRate: records.length ? Math.round((thumbsDown / records.length) * 100) : 0,
+    newItems: records.filter(record => record.reviewStatus === "new").length,
+    queuedImprovements: records.filter(record => record.pipelineStatus === "queued").length,
+    draftedImprovements: records.filter(record => record.pipelineStatus === "drafted").length,
+  };
+}
+
+function buildImprovementPlan(record: FeedbackRecord): string {
+  const comment = record.comment || "Tiada ulasan khusus diberikan.";
+  const citationTitles = record.citations.map(citation => citation.title).filter(Boolean).slice(0, 5);
+  return [
+    "Cadangan penambahbaikan automatik:",
+    `1. Semak semula soalan pengguna: ${truncateText(record.question, 360)}`,
+    `2. Kenal pasti bantahan pengguna: ${truncateText(comment, 360)}`,
+    "3. Uji semula jawapan dengan konteks BigQuery/Knowledge Catalog dan pastikan batasan korpus disebut jika rujukan tidak mencukupi.",
+    citationTitles.length
+      ? `4. Bandingkan dengan sitasi asal: ${citationTitles.join("; ")}.`
+      : "4. Tambah atau imbas sumber rasmi berkaitan sebelum membuat kesimpulan hukum baharu.",
+    "5. Jika benar-benar terbukti, kemas kini arahan sistem atau korpus RAG; jangan fine-tune daripada maklum balas tunggal tanpa semakan manusia.",
+  ].join("\n");
+}
+
 const SOURCE_PORTALS: CrawlSource[] = [
   {
     id: 1,
@@ -647,6 +785,7 @@ function assertBqIdentifiers() {
     BQ_CORPUS_TABLE,
     BQ_CHUNKS_TABLE,
     BQ_GRAPH_TABLE,
+    BQ_CRAWL_RUNS_TABLE,
   };
 
   for (const [name, value] of Object.entries(identifiers)) {
@@ -815,6 +954,29 @@ async function ensureBigQueryKnowledgeStore(): Promise<boolean> {
           created_at TIMESTAMP
         )
       `);
+      await runBigQuery(`
+        CREATE TABLE IF NOT EXISTS ${bqTableRef(BQ_CRAWL_RUNS_TABLE)} (
+          event_id STRING NOT NULL,
+          run_id STRING NOT NULL,
+          source_id INT64,
+          source_name STRING,
+          url STRING,
+          title STRING,
+          status STRING,
+          log STRING,
+          display_time STRING,
+          pages_count INT64,
+          chunks_count INT64,
+          nodes_count INT64,
+          links_count INT64,
+          crawler STRING,
+          gcs_status STRING,
+          bigquery_status STRING,
+          knowledge_catalog_status STRING,
+          created_at TIMESTAMP,
+          updated_at TIMESTAMP
+        )
+      `);
 
       try {
         await runBigQuery(`
@@ -946,6 +1108,166 @@ async function writeRowsToBigQuery(document: CrawledDocument, documentId: string
   } catch (err: any) {
     console.error("BigQuery knowledge write failed:", err.message);
     return "FAILED";
+  }
+}
+
+async function writeCrawlLogToBigQuery(logEntry: CrawlLog, runId: string): Promise<void> {
+  if (!isGcpNativeConfigured()) return;
+
+  try {
+    await ensureBigQueryKnowledgeStore();
+    const client = getBigQueryClient();
+    if (!client) return;
+
+    const now = new Date().toISOString();
+    await client.dataset(BQ_DATASET).table(BQ_CRAWL_RUNS_TABLE).insert([{
+      event_id: randomUUID(),
+      run_id: runId,
+      source_id: logEntry.sourceId ?? null,
+      source_name: logEntry.sourceName || "",
+      url: logEntry.url,
+      title: logEntry.title,
+      status: logEntry.status,
+      log: logEntry.log,
+      display_time: logEntry.time,
+      pages_count: logEntry.pagesCount ?? null,
+      chunks_count: logEntry.chunksCount ?? null,
+      nodes_count: logEntry.nodesCount ?? null,
+      links_count: logEntry.linksCount ?? null,
+      crawler: logEntry.crawler || "",
+      gcs_status: logEntry.gcsStatus || "",
+      bigquery_status: logEntry.bigQueryStatus || "",
+      knowledge_catalog_status: logEntry.knowledgeCatalogStatus || "",
+      created_at: now,
+      updated_at: now,
+    }], { ignoreUnknownValues: true } as any);
+  } catch (err: any) {
+    console.error("BigQuery crawl log write failed:", err.message);
+  }
+}
+
+function hostnameFor(value?: string): string {
+  if (!value) return "";
+  try {
+    return new URL(value).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
+function timeFromBigQueryTimestamp(value: any): string {
+  const rawValue = value?.value || value;
+  const date = rawValue ? new Date(rawValue) : new Date();
+  if (Number.isNaN(date.getTime())) return getCrawlTimeString();
+  return date.toLocaleTimeString("ms-MY", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+function numberFromBigQueryInteger(value: any): number {
+  if (value == null) return 0;
+  const rawValue = value?.value ?? value;
+  const parsed = Number(rawValue);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+async function inferCrawlLogsFromBigQueryCorpus(): Promise<CrawlLog[]> {
+  const rows = await runBigQuery(`
+    SELECT
+      source_url,
+      source_name,
+      ANY_VALUE(title) AS title,
+      ANY_VALUE(crawler) AS crawler,
+      COUNT(DISTINCT document_id) AS documents_count,
+      MAX(updated_at) AS last_updated
+    FROM ${bqTableRef(BQ_CORPUS_TABLE)}
+    WHERE source_url IS NOT NULL
+    GROUP BY source_url, source_name
+    ORDER BY last_updated DESC
+  `);
+
+  return SOURCE_PORTALS.flatMap(source => {
+    const sourceHost = hostnameFor(source.url);
+    const sourceRows = rows.filter(row => {
+      const rowHost = hostnameFor(row.source_url);
+      return row.source_name === source.name || Boolean(sourceHost && rowHost && rowHost.endsWith(sourceHost));
+    });
+
+    if (sourceRows.length === 0) return [];
+
+    const latestRow = sourceRows[0];
+    const documentsCount = sourceRows.reduce((total, row) => total + numberFromBigQueryInteger(row.documents_count), 0);
+    return [{
+      sourceId: source.id,
+      sourceName: source.name,
+      url: source.url,
+      title: latestRow.title || source.name,
+      status: "SUCCESS" as CrawlLogStatus,
+      log: `Rekod berjaya diinfer daripada ${documentsCount} dokumen sedia ada dalam BigQuery corpus.`,
+      time: timeFromBigQueryTimestamp(latestRow.last_updated),
+      pagesCount: documentsCount || undefined,
+      crawler: latestRow.crawler || undefined,
+      bigQueryStatus: "SUCCESS" as GcpPipelineStatus,
+    }];
+  });
+}
+
+async function readLatestCrawlLogsFromBigQuery(): Promise<CrawlLog[]> {
+  if (!isGcpNativeConfigured()) return [];
+
+  try {
+    await ensureBigQueryKnowledgeStore();
+    const rows = await runBigQuery(`
+      SELECT
+        run_id,
+        source_id,
+        source_name,
+        url,
+        title,
+        status,
+        log,
+        display_time,
+        pages_count,
+        chunks_count,
+        nodes_count,
+        links_count,
+        crawler,
+        gcs_status,
+        bigquery_status,
+        knowledge_catalog_status
+      FROM ${bqTableRef(BQ_CRAWL_RUNS_TABLE)}
+      WHERE source_id IS NOT NULL
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY source_id
+        ORDER BY updated_at DESC, created_at DESC
+      ) = 1
+      ORDER BY source_id ASC
+    `);
+
+    const crawlLogs: CrawlLog[] = rows.map(row => ({
+      runId: row.run_id,
+      sourceId: numberFromBigQueryInteger(row.source_id),
+      sourceName: row.source_name || undefined,
+      url: row.url || "",
+      title: row.title || row.source_name || row.url || "Rekod Crawl",
+      status: row.status === "FAILED" ? "FAILED" : row.status === "RUNNING" ? "RUNNING" : "SUCCESS" as CrawlLogStatus,
+      log: row.log || "",
+      time: row.display_time || "",
+      pagesCount: row.pages_count == null ? undefined : numberFromBigQueryInteger(row.pages_count),
+      chunksCount: row.chunks_count == null ? undefined : numberFromBigQueryInteger(row.chunks_count),
+      nodesCount: row.nodes_count == null ? undefined : numberFromBigQueryInteger(row.nodes_count),
+      linksCount: row.links_count == null ? undefined : numberFromBigQueryInteger(row.links_count),
+      crawler: row.crawler || undefined,
+      gcsStatus: row.gcs_status || undefined,
+      bigQueryStatus: row.bigquery_status || undefined,
+      knowledgeCatalogStatus: row.knowledge_catalog_status || undefined,
+    }));
+    return crawlLogs.length > 0 ? crawlLogs : await inferCrawlLogsFromBigQueryCorpus();
+  } catch (err: any) {
+    console.error("BigQuery crawl log read failed:", err.message);
+    return [];
   }
 }
 
@@ -2038,6 +2360,112 @@ app.post("/api/session/reset", async (req, res) => {
   }
 });
 
+app.get("/api/feedback", async (req, res) => {
+  try {
+    getOrCreateSessionId(req, res);
+    const records = loadFeedbackRecords().sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    res.json({
+      records,
+      analytics: getFeedbackAnalytics(records),
+      pipeline: {
+        policy: "human_review_required",
+        description: "Maklum balas negatif ditukar kepada draf pelan penambahbaikan; reviewer perlu mengesahkan sebelum prompt, korpus, atau fine-tuning diubah.",
+      },
+    });
+  } catch (error: any) {
+    console.error("Feedback Read Error:", error);
+    res.status(500).json({ error: error.message || "Gagal membaca maklum balas." });
+  }
+});
+
+app.post("/api/feedback", async (req, res) => {
+  try {
+    const sessionId = getOrCreateSessionId(req, res);
+    const records = loadFeedbackRecords();
+    const messageId = sanitizeText(req.body?.messageId, 120);
+    if (!messageId) {
+      return res.status(400).json({ error: "messageId diperlukan." });
+    }
+
+    const existingIndex = records.findIndex(record => record.sessionId === sessionId && record.messageId === messageId);
+    const previous = existingIndex >= 0 ? records[existingIndex] : undefined;
+    const next = sanitizeFeedbackRecord({ ...req.body, sessionId }, previous);
+
+    if (next.rating === "down" && next.comment.trim()) {
+      next.pipelineStatus = previous?.pipelineStatus === "applied" ? "applied" : "queued";
+    }
+
+    if (existingIndex >= 0) {
+      records[existingIndex] = next;
+    } else {
+      records.push(next);
+    }
+
+    saveFeedbackRecords(records);
+    res.json({ success: true, record: next, analytics: getFeedbackAnalytics(records) });
+  } catch (error: any) {
+    console.error("Feedback Write Error:", error);
+    res.status(500).json({ error: error.message || "Gagal menyimpan maklum balas." });
+  }
+});
+
+app.patch("/api/feedback/:id", async (req, res) => {
+  try {
+    getOrCreateSessionId(req, res);
+    const records = loadFeedbackRecords();
+    const index = records.findIndex(record => record.id === req.params.id);
+    if (index === -1) {
+      return res.status(404).json({ error: "Rekod maklum balas tidak ditemui." });
+    }
+
+    const current = records[index];
+    const next = sanitizeFeedbackRecord(
+      {
+        ...current,
+        reviewStatus: req.body?.reviewStatus ?? current.reviewStatus,
+        reviewerNote: req.body?.reviewerNote ?? current.reviewerNote,
+        pipelineStatus: req.body?.pipelineStatus ?? current.pipelineStatus,
+        improvementPlan: req.body?.improvementPlan ?? current.improvementPlan,
+      },
+      current
+    );
+    records[index] = next;
+    saveFeedbackRecords(records);
+    res.json({ success: true, record: next, analytics: getFeedbackAnalytics(records) });
+  } catch (error: any) {
+    console.error("Feedback Update Error:", error);
+    res.status(500).json({ error: error.message || "Gagal mengemas kini maklum balas." });
+  }
+});
+
+app.post("/api/feedback/:id/improvement", async (req, res) => {
+  try {
+    getOrCreateSessionId(req, res);
+    const records = loadFeedbackRecords();
+    const index = records.findIndex(record => record.id === req.params.id);
+    if (index === -1) {
+      return res.status(404).json({ error: "Rekod maklum balas tidak ditemui." });
+    }
+
+    const current = records[index];
+    const next = sanitizeFeedbackRecord(
+      {
+        ...current,
+        reviewStatus: current.reviewStatus === "new" ? "reviewing" : current.reviewStatus,
+        pipelineStatus: "drafted",
+        improvementPlan: buildImprovementPlan(current),
+      },
+      current
+    );
+    records[index] = next;
+    saveFeedbackRecords(records);
+    res.json({ success: true, record: next, analytics: getFeedbackAnalytics(records) });
+  } catch (error: any) {
+    console.error("Feedback Improvement Error:", error);
+    res.status(500).json({ error: error.message || "Gagal membina pelan penambahbaikan." });
+  }
+});
+
 // 1. Chat endpoint with TRUE Hybrid GraphRAG Grounding & customized Shafi'i context
 app.post("/api/chat", async (req, res) => {
   try {
@@ -2223,6 +2651,7 @@ app.get("/api/crawl-sources", (req, res) => {
 	      bigQueryCorpusTable: BQ_CORPUS_TABLE,
 	      bigQueryChunksTable: BQ_CHUNKS_TABLE,
 	      bigQueryGraphTable: BQ_GRAPH_TABLE,
+	      bigQueryCrawlRunsTable: BQ_CRAWL_RUNS_TABLE,
 	      bigQueryEmbeddingModel: BQ_EMBEDDING_MODEL,
 	      cloudStorageRawBucket: GCS_RAW_BUCKET,
 	      knowledgeCatalogEntryGroup: KNOWLEDGE_CATALOG_ENTRY_GROUP
@@ -2230,10 +2659,13 @@ app.get("/api/crawl-sources", (req, res) => {
 	  });
 });
 
-app.get("/api/crawl-logs", (req, res) => {
+app.get("/api/crawl-logs", async (req, res) => {
+  const persistedLogs = batchCrawlLogs.length > 0 ? [] : await readLatestCrawlLogsFromBigQuery();
+  const logs = batchCrawlLogs.length > 0 ? batchCrawlLogs : persistedLogs;
+
   res.json({
     isCrawling: isBatchCrawling,
-    logs: batchCrawlLogs,
+    logs,
     sources: SOURCE_PORTALS,
     total: SOURCE_PORTALS.length,
 	    config: {
@@ -2247,6 +2679,7 @@ app.get("/api/crawl-logs", (req, res) => {
 	      bigQueryCorpusTable: BQ_CORPUS_TABLE,
 	      bigQueryChunksTable: BQ_CHUNKS_TABLE,
 	      bigQueryGraphTable: BQ_GRAPH_TABLE,
+	      bigQueryCrawlRunsTable: BQ_CRAWL_RUNS_TABLE,
 	      bigQueryEmbeddingModel: BQ_EMBEDDING_MODEL,
 	      cloudStorageRawBucket: GCS_RAW_BUCKET,
 	      knowledgeCatalogEntryGroup: KNOWLEDGE_CATALOG_ENTRY_GROUP
@@ -2268,6 +2701,7 @@ app.post("/api/ingest-batch", async (req, res) => {
 
   isBatchCrawling = true;
   batchCrawlLogs = [];
+  const batchRunId = randomUUID();
 
   // Fire-and-forget background crawling
   (async () => {
@@ -2275,6 +2709,7 @@ app.post("/api/ingest-batch", async (req, res) => {
       const timeStr = getCrawlTimeString();
       const maxPages = getSourceMaxPages(source);
       const logEntry: CrawlLog = {
+        runId: batchRunId,
         sourceId: source.id,
         sourceName: source.name,
         url: source.url,
@@ -2284,6 +2719,7 @@ app.post("/api/ingest-batch", async (req, res) => {
         time: timeStr
       };
       batchCrawlLogs.push(logEntry);
+      await writeCrawlLogToBigQuery(logEntry, batchRunId);
 
       try {
         console.log(`Crawler: Ingesting source: ${source.name} (${source.url})`);
@@ -2307,6 +2743,7 @@ app.post("/api/ingest-batch", async (req, res) => {
       }
 
       logEntry.time = getCrawlTimeString();
+      await writeCrawlLogToBigQuery(logEntry, batchRunId);
     }
     isBatchCrawling = false;
   })();

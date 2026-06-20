@@ -249,6 +249,10 @@ resource "google_cloud_run_service" "mursyid_app" {
           value = var.bq_graph_table
         }
         env {
+          name  = "BQ_CRAWL_RUNS_TABLE"
+          value = var.bq_crawl_runs_table
+        }
+        env {
           name  = "BQ_EMBEDDING_MODEL"
           value = var.bq_embedding_model
         }

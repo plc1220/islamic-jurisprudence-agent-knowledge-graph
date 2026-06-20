@@ -15,29 +15,46 @@ import {
   Globe,
 } from "lucide-react";
 
-import { ChatMessage, KnowledgeNode, KnowledgeLink, SourceWebsite, PresetQuestion } from "./types";
+import { ChatMessage, KnowledgeNode, KnowledgeLink, SourceWebsite, PresetQuestion, PersistedAppState } from "./types";
 import { OFFICIAL_SOURCES, PRESET_QUESTIONS, INITIAL_NODES, INITIAL_LINKS } from "./data";
 import { KnowledgeGraph } from "./components/KnowledgeGraph";
 import { SourceCard } from "./components/SourceCard";
 import { ArchitectureExplainer } from "./components/ArchitectureExplainer";
 import { CrawlerPanel } from "./components/CrawlerPanel";
 import { ChatMarkdownRenderer } from "./components/ChatMarkdownRenderer";
+import { RelevantGraphSnippet } from "./components/RelevantGraphSnippet";
+
+const createWelcomeMessage = (): ChatMessage => ({
+  id: "welcome",
+  role: "model",
+  content: "Assalamualaikum rukun ilmuwan. Saya adalah Ejen Pakar Syariah Islam berpandukan Mazhab Syafi'i dan rujukan berautoriti Malaysia (seperti JAKIM & Jabatan Mufti WP). Sila tanyakan kemusykilan hukum fiqh, hadis, fatwa semasa, atau soalan sejarah Islam anda di bawah.",
+  timestamp: new Date(),
+});
+
+function reviveChatMessages(messages: any): ChatMessage[] {
+  if (!Array.isArray(messages)) return [];
+
+  return messages
+    .filter((message) => message && typeof message.content === "string")
+    .map((message) => {
+      const timestamp = new Date(message.timestamp);
+      return {
+        ...message,
+        timestamp: Number.isNaN(timestamp.getTime()) ? new Date() : timestamp,
+      } as ChatMessage;
+    });
+}
 
 export default function App() {
   // Navigation State
   const [activeTab, setActiveTab] = useState<"chat" | "graph" | "sources" | "engineering">("chat");
   const [graphSubTab, setGraphSubTab] = useState<"visualize" | "ingest">("visualize");
   const [isAgentInfoOpen, setIsAgentInfoOpen] = useState(false);
+  const [isSessionHydrated, setIsSessionHydrated] = useState(false);
+  const [pendingSelectedNodeId, setPendingSelectedNodeId] = useState<string | null>(null);
 
   // Chat State
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
-    {
-      id: "welcome",
-      role: "model",
-      content: "Assalamualaikum rukun ilmuwan. Saya adalah Ejen Pakar Syariah Islam berpandukan Mazhab Syafi'i dan rujukan berautoriti Malaysia (seperti JAKIM & Jabatan Mufti WP). Sila tanyakan kemusykilan hukum fiqh, hadis, fatwa semasa, atau soalan sejarah Islam anda di bawah.",
-      timestamp: new Date()
-    }
-  ]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => [createWelcomeMessage()]);
   const [userInput, setUserInput] = useState("");
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
@@ -53,6 +70,7 @@ export default function App() {
   // Chat scroll container
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const persistSessionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const scrollContainer = chatScrollRef.current;
@@ -64,12 +82,105 @@ export default function App() {
     });
   }, [chatMessages, isChatLoading]);
 
-  // Set default selected node for display details
   useEffect(() => {
-    if (nodes.length > 0 && !selectedNode) {
-      setSelectedNode(nodes[0]);
+    let cancelled = false;
+
+    const hydrateSession = async () => {
+      try {
+        const response = await fetch("/api/session");
+        if (!response.ok) return;
+
+        const data = await response.json();
+        const state = (data.state || {}) as PersistedAppState;
+        if (cancelled) return;
+
+        if (state.activeTab) setActiveTab(state.activeTab);
+        if (state.graphSubTab) setGraphSubTab(state.graphSubTab);
+        if (typeof state.isAgentInfoOpen === "boolean") setIsAgentInfoOpen(state.isAgentInfoOpen);
+        if (typeof state.userInput === "string") setUserInput(state.userInput);
+
+        const restoredMessages = reviveChatMessages(state.chatMessages);
+        if (restoredMessages.length > 0) {
+          setChatMessages(restoredMessages);
+        }
+
+        if (state.selectedNodeId !== undefined) {
+          setPendingSelectedNodeId(state.selectedNodeId);
+          const matchingNode = nodes.find((node) => node.id === state.selectedNodeId);
+          if (matchingNode) {
+            setSelectedNode(matchingNode);
+          } else if (state.selectedNodeId === null) {
+            setSelectedNode(null);
+          }
+        }
+      } catch (err) {
+        console.error("Gagal memulihkan sesi aplikasi:", err);
+      } finally {
+        if (!cancelled) setIsSessionHydrated(true);
+      }
+    };
+
+    hydrateSession();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isSessionHydrated) return;
+
+    if (persistSessionTimerRef.current) {
+      clearTimeout(persistSessionTimerRef.current);
     }
-  }, [nodes]);
+
+    const payload: PersistedAppState = {
+      activeTab,
+      graphSubTab,
+      isAgentInfoOpen,
+      selectedNodeId: selectedNode?.id ?? null,
+      userInput,
+      chatMessages,
+    };
+
+    persistSessionTimerRef.current = setTimeout(() => {
+      fetch("/api/session", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).catch((err) => {
+        console.error("Gagal menyimpan sesi aplikasi:", err);
+      });
+    }, 450);
+
+    return () => {
+      if (persistSessionTimerRef.current) {
+        clearTimeout(persistSessionTimerRef.current);
+      }
+    };
+  }, [activeTab, graphSubTab, isAgentInfoOpen, selectedNode, userInput, chatMessages, isSessionHydrated]);
+
+  // Keep the selected detail panel aligned with refreshed or restored graph data.
+  useEffect(() => {
+    if (nodes.length === 0) {
+      setSelectedNode(null);
+      return;
+    }
+
+    if (pendingSelectedNodeId) {
+      const pendingNode = nodes.find((node) => node.id === pendingSelectedNodeId);
+      if (pendingNode) {
+        setSelectedNode(pendingNode);
+        setPendingSelectedNodeId(null);
+        return;
+      }
+    }
+
+    setSelectedNode((current) => {
+      if (!current) return nodes[0];
+      return nodes.find((node) => node.id === current.id) || nodes[0];
+    });
+  }, [nodes, pendingSelectedNodeId]);
 
   // Send message to Express chat endpoint with BigQuery/Knowledge Catalog grounding
   const handleSendMessage = async (customText?: string) => {
@@ -118,7 +229,8 @@ export default function App() {
         role: "model",
         content: data.text,
         timestamp: new Date(),
-        citations: data.citations
+        citations: data.citations,
+        relevantGraph: data.relevantGraph
       };
 
       setChatMessages((prev) => [...prev, botMsg]);
@@ -146,9 +258,11 @@ export default function App() {
       if (response.ok && data.nodes && data.links) {
         setNodes(data.nodes);
         setLinks(data.links);
-        if (data.nodes.length > 0) {
-          setSelectedNode(data.nodes[0]);
-        }
+        setSelectedNode((current) => {
+          if (!data.nodes.length) return null;
+          if (!current) return data.nodes[0];
+          return data.nodes.find((node: KnowledgeNode) => node.id === current.id) || data.nodes[0];
+        });
       }
     } catch (err) {
       console.error("Gagal mendapatkan graf daripada pelayan:", err);
@@ -171,16 +285,19 @@ export default function App() {
       if (response.ok && data.nodes && data.links) {
         setNodes(data.nodes);
         setLinks(data.links);
+        setPendingSelectedNodeId(null);
         if (data.nodes.length > 0) {
           setSelectedNode(data.nodes[0]);
         }
       } else {
+        setPendingSelectedNodeId(null);
         setNodes(INITIAL_NODES);
         setLinks(INITIAL_LINKS);
         setSelectedNode(INITIAL_NODES[0]);
       }
     } catch (err) {
       console.error("Gagal menetapkan semula graf di pelayan, menetapkan semula secara lokal:", err);
+      setPendingSelectedNodeId(null);
       setNodes(INITIAL_NODES);
       setLinks(INITIAL_LINKS);
       setSelectedNode(INITIAL_NODES[0]);
@@ -277,7 +394,7 @@ export default function App() {
             <BookOpen className="w-4 h-4 shrink-0" />
             Saranan & Katalog Dokumen Sahih
           </button>
-          
+
           <button
             onClick={() => setActiveTab("engineering")}
             className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold tracking-wide transition-all cursor-pointer ${
@@ -446,6 +563,13 @@ export default function App() {
                               <ChatMarkdownRenderer content={msg.content} />
                             )}
 
+                            {msg.role === "model" && msg.relevantGraph?.nodes?.length > 0 && (
+                              <RelevantGraphSnippet
+                                nodes={msg.relevantGraph.nodes}
+                                links={msg.relevantGraph.links || []}
+                              />
+                            )}
+
                             {/* Citations/Links block (Grounding display - explicit, no bloat) */}
                             {msg.citations && msg.citations.length > 0 && (
                               <div className="mt-3 pt-2.5 border-t border-[#E5E1D8] space-y-1.5 text-left">
@@ -594,7 +718,10 @@ export default function App() {
                         <KnowledgeGraph
                           nodes={nodes}
                           links={links}
-                          onNodeSelect={(node) => setSelectedNode(node)}
+                          onNodeSelect={(node) => {
+                            setPendingSelectedNodeId(null);
+                            setSelectedNode(node);
+                          }}
                           selectedNodeId={selectedNode?.id}
                           onResetGraph={handleResetGraph}
                         />

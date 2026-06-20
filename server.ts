@@ -5,7 +5,8 @@ import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import fs from "fs";
 import { spawn } from "child_process";
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
+import { createClient } from "redis";
 import { BigQuery } from "@google-cloud/bigquery";
 import { Storage } from "@google-cloud/storage";
 import { GoogleAuth } from "google-auth-library";
@@ -56,10 +57,13 @@ const KNOWLEDGE_CATALOG_ENTRY_GROUP = process.env.KNOWLEDGE_CATALOG_ENTRY_GROUP 
 const KNOWLEDGE_CATALOG_ENTRY_TYPE = process.env.KNOWLEDGE_CATALOG_ENTRY_TYPE || "mursyid-knowledge-entry";
 const KNOWLEDGE_CATALOG_ASPECT_TYPE = process.env.KNOWLEDGE_CATALOG_ASPECT_TYPE || "mursyid-context";
 const MDCODE_EXPORT_DIR = process.env.MDCODE_EXPORT_DIR || path.join(process.cwd(), "catalog-export");
+const REDIS_URL = process.env.REDIS_URL || "";
+const SESSION_TTL_SECONDS = Math.max(300, parseInt(process.env.SESSION_TTL_SECONDS || "86400", 10));
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
+app.set("trust proxy", 1);
 app.use(express.json());
 
 // ==========================================
@@ -157,6 +161,9 @@ type RetrievedGraphTriple = {
   title: string;
   sourceUrl: string;
   documentId?: string;
+  sourceNode: KnowledgeNode;
+  targetNode: KnowledgeNode;
+  link: KnowledgeLink;
 };
 type GcpPipelineStatus = "SUCCESS" | "PARTIAL" | "FAILED" | "SKIPPED_NOT_CONFIGURED";
 type IngestStats = {
@@ -189,8 +196,267 @@ type CrawlLog = {
   bigQueryStatus?: GcpPipelineStatus;
   knowledgeCatalogStatus?: GcpPipelineStatus;
 };
+type SessionChatMessage = {
+  id: string;
+  role: "user" | "model" | "system";
+  content: string;
+  timestamp: string;
+  citations?: { title: string; url: string }[];
+  relevantGraph?: GraphExtraction;
+};
+type PersistedSessionState = {
+  activeTab?: "chat" | "graph" | "sources" | "engineering";
+  graphSubTab?: "visualize" | "ingest";
+  isAgentInfoOpen?: boolean;
+  selectedNodeId?: string | null;
+  userInput?: string;
+  chatMessages?: SessionChatMessage[];
+  updatedAt?: string;
+};
+
+function emptyRelevantGraph(): GraphExtraction {
+  return { nodes: [], links: [] };
+}
+
+function graphFromRetrievedTriples(triples: RetrievedGraphTriple[]): GraphExtraction {
+  const nodesById = new Map<string, KnowledgeNode>();
+  const linksByKey = new Map<string, KnowledgeLink>();
+
+  for (const triple of triples) {
+    nodesById.set(triple.sourceNode.id, triple.sourceNode);
+    nodesById.set(triple.targetNode.id, triple.targetNode);
+    const key = `${triple.link.source}::${triple.link.relation}::${triple.link.target}`;
+    linksByKey.set(key, triple.link);
+  }
+
+  return {
+    nodes: Array.from(nodesById.values()),
+    links: Array.from(linksByKey.values()),
+  };
+}
 
 let batchCrawlLogs: CrawlLog[] = [];
+
+// ==========================================
+// SESSION STATE STORE: REDIS WITH MEMORY FALLBACK
+// ==========================================
+const SESSION_COOKIE_NAME = "mursyid_session_id";
+const MAX_SESSION_MESSAGES = 80;
+const memorySessions = new Map<string, { state: PersistedSessionState; expiresAt: number }>();
+let redisClient: ReturnType<typeof createClient> | null = null;
+let redisConnectPromise: Promise<void> | null = null;
+
+const validTabs = new Set(["chat", "graph", "sources", "engineering"]);
+const validGraphSubTabs = new Set(["visualize", "ingest"]);
+
+function parseCookieHeader(header?: string): Record<string, string> {
+  if (!header) return {};
+  return Object.fromEntries(
+    header
+      .split(";")
+      .map(part => part.trim())
+      .filter(Boolean)
+      .map(part => {
+        const index = part.indexOf("=");
+        if (index === -1) return [part, ""];
+        return [part.slice(0, index), decodeURIComponent(part.slice(index + 1))];
+      })
+  );
+}
+
+function isValidSessionId(value?: string): value is string {
+  return Boolean(value && /^[a-zA-Z0-9-]{20,80}$/.test(value));
+}
+
+function isSecureRequest(req: express.Request): boolean {
+  return req.secure || req.headers["x-forwarded-proto"] === "https";
+}
+
+function getOrCreateSessionId(req: express.Request, res: express.Response): string {
+  const cookies = parseCookieHeader(req.headers.cookie);
+  const existingSessionId = cookies[SESSION_COOKIE_NAME];
+  const sessionId = isValidSessionId(existingSessionId) ? existingSessionId : randomUUID();
+
+  res.cookie(SESSION_COOKIE_NAME, sessionId, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: isSecureRequest(req),
+    maxAge: SESSION_TTL_SECONDS * 1000,
+    path: "/",
+  });
+
+  return sessionId;
+}
+
+function sanitizeText(value: any, maxLength: number): string {
+  return typeof value === "string" ? value.slice(0, maxLength) : "";
+}
+
+function sanitizeRelevantGraph(value: any): GraphExtraction | undefined {
+  if (!value || !Array.isArray(value.nodes)) return undefined;
+
+  const nodes = value.nodes
+    .filter((node: any) => node && typeof node.id === "string")
+    .slice(0, 80)
+    .map((node: any) => ({
+      id: sanitizeText(node.id, 120),
+      type: sanitizeText(node.type, 40) || "Entity",
+      label: sanitizeText(node.label, 220) || sanitizeText(node.id, 120),
+      description: sanitizeText(node.description, 1200),
+    }));
+  const nodeIds = new Set(nodes.map(node => node.id));
+  const links = (Array.isArray(value.links) ? value.links : [])
+    .filter((link: any) => {
+      const source = typeof link.source === "object" ? link.source?.id : link.source;
+      const target = typeof link.target === "object" ? link.target?.id : link.target;
+      return nodeIds.has(String(source)) && nodeIds.has(String(target));
+    })
+    .slice(0, 160)
+    .map((link: any) => ({
+      source: sanitizeText(typeof link.source === "object" ? link.source?.id : link.source, 120),
+      target: sanitizeText(typeof link.target === "object" ? link.target?.id : link.target, 120),
+      relation: sanitizeText(link.relation, 120) || "RELATION",
+    }));
+
+  return { nodes, links };
+}
+
+function sanitizeChatMessages(value: any): SessionChatMessage[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+
+  return value
+    .slice(-MAX_SESSION_MESSAGES)
+    .filter((message: any) => message && typeof message.content === "string")
+    .map((message: any) => {
+      const timestamp = new Date(message.timestamp);
+      const sanitized: SessionChatMessage = {
+        id: sanitizeText(message.id, 120) || `msg-${Date.now()}`,
+        role: message.role === "user" || message.role === "system" ? message.role : "model",
+        content: sanitizeText(message.content, 12000),
+        timestamp: Number.isNaN(timestamp.getTime()) ? new Date().toISOString() : timestamp.toISOString(),
+      };
+
+      if (Array.isArray(message.citations)) {
+        sanitized.citations = message.citations
+          .filter((citation: any) => citation && typeof citation.url === "string")
+          .slice(0, 20)
+          .map((citation: any) => ({
+            title: sanitizeText(citation.title, 240) || sanitizeText(citation.url, 240),
+            url: sanitizeText(citation.url, 1000),
+          }));
+      }
+
+      const relevantGraph = sanitizeRelevantGraph(message.relevantGraph);
+      if (relevantGraph) {
+        sanitized.relevantGraph = relevantGraph;
+      }
+
+      return sanitized;
+    });
+}
+
+function sanitizeSessionState(input: any, previous: PersistedSessionState = {}, touchUpdatedAt = true): PersistedSessionState {
+  const next: PersistedSessionState = { ...previous };
+
+  if (validTabs.has(input?.activeTab)) {
+    next.activeTab = input.activeTab;
+  }
+  if (validGraphSubTabs.has(input?.graphSubTab)) {
+    next.graphSubTab = input.graphSubTab;
+  }
+  if (typeof input?.isAgentInfoOpen === "boolean") {
+    next.isAgentInfoOpen = input.isAgentInfoOpen;
+  }
+  if (input?.selectedNodeId === null || typeof input?.selectedNodeId === "string") {
+    next.selectedNodeId = input.selectedNodeId === null ? null : sanitizeText(input.selectedNodeId, 120);
+  }
+  if (typeof input?.userInput === "string") {
+    next.userInput = sanitizeText(input.userInput, 4000);
+  }
+
+  const chatMessages = sanitizeChatMessages(input?.chatMessages);
+  if (chatMessages) {
+    next.chatMessages = chatMessages;
+  }
+
+  if (touchUpdatedAt) {
+    next.updatedAt = new Date().toISOString();
+  } else if (typeof input?.updatedAt === "string") {
+    next.updatedAt = sanitizeText(input.updatedAt, 80);
+  }
+  return next;
+}
+
+async function getConnectedRedisClient(): Promise<ReturnType<typeof createClient> | null> {
+  if (!REDIS_URL) return null;
+
+  if (!redisClient) {
+    redisClient = createClient({ url: REDIS_URL });
+    redisClient.on("error", (err) => {
+      console.warn("Redis session store warning:", err.message);
+    });
+  }
+
+  if (!redisClient.isOpen && !redisConnectPromise) {
+    redisConnectPromise = redisClient
+      .connect()
+      .then(() => undefined)
+      .catch((err) => {
+        console.warn("Redis session store unavailable; using in-memory sessions:", err.message);
+        redisConnectPromise = null;
+      });
+  }
+
+  if (redisConnectPromise) {
+    await redisConnectPromise;
+  }
+
+  return redisClient.isOpen ? redisClient : null;
+}
+
+function pruneExpiredMemorySessions() {
+  const now = Date.now();
+  for (const [sessionId, entry] of memorySessions.entries()) {
+    if (entry.expiresAt <= now) {
+      memorySessions.delete(sessionId);
+    }
+  }
+}
+
+async function readSessionState(sessionId: string): Promise<PersistedSessionState> {
+  const redis = await getConnectedRedisClient();
+  const key = `mursyid:session:${sessionId}`;
+
+  if (redis) {
+    const raw = await redis.get(key);
+    if (!raw) return {};
+    try {
+      return sanitizeSessionState(JSON.parse(String(raw)), {}, false);
+    } catch {
+      return {};
+    }
+  }
+
+  pruneExpiredMemorySessions();
+  return memorySessions.get(sessionId)?.state || {};
+}
+
+async function writeSessionState(sessionId: string, state: PersistedSessionState): Promise<"redis" | "memory"> {
+  const redis = await getConnectedRedisClient();
+  const key = `mursyid:session:${sessionId}`;
+
+  if (redis) {
+    await redis.set(key, JSON.stringify(state), { EX: SESSION_TTL_SECONDS });
+    return "redis";
+  }
+
+  pruneExpiredMemorySessions();
+  memorySessions.set(sessionId, {
+    state,
+    expiresAt: Date.now() + SESSION_TTL_SECONDS * 1000,
+  });
+  return "memory";
+}
 
 const SOURCE_PORTALS: CrawlSource[] = [
   {
@@ -279,6 +545,10 @@ const SOURCE_PORTALS: CrawlSource[] = [
 // WORKING HOURS CONTROL MIDDLEWARE
 // ==========================================
 app.use("/api", (req, res, next) => {
+  if (req.path === "/session" || req.path === "/session/reset") {
+    return next();
+  }
+
   if (process.env.BYPASS_WORKING_HOURS !== "false") {
     return next();
   }
@@ -1105,9 +1375,13 @@ async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10
     const selectedKeywords = keywords.slice(0, 4).map(keyword => keyword.toLowerCase());
     const rows = await runBigQuery(`
       SELECT DISTINCT
+        source_id,
         source_label,
+        source_type,
         relation,
+        target_id,
         target_label,
+        target_type,
         source_description,
         target_description,
         source_url,
@@ -1126,12 +1400,37 @@ async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10
       LIMIT @limit
     `, { keywords: selectedKeywords, limit });
 
-    return rows.map(row => ({
-      text: `[Knowledge Catalog/BigQuery Graph] ${row.source_label} -> ${row.relation} -> ${row.target_label} (${row.source_description || ""} | ${row.target_description || ""})`,
-      title: row.title || row.source_url || "Knowledge Catalog graph source",
-      sourceUrl: row.source_url || "",
-      documentId: row.document_id || "",
-    }));
+    return rows
+      .filter(row => row.source_id && row.target_id)
+      .map(row => {
+        const sourceNode: KnowledgeNode = {
+          id: row.source_id,
+          type: row.source_type || "Entity",
+          label: row.source_label || row.source_id,
+          description: row.source_description || "",
+        };
+        const targetNode: KnowledgeNode = {
+          id: row.target_id,
+          type: row.target_type || "Entity",
+          label: row.target_label || row.target_id,
+          description: row.target_description || "",
+        };
+        const relation = row.relation || "RELATION";
+
+        return {
+          text: `[Knowledge Catalog/BigQuery Graph] ${sourceNode.label} -> ${relation} -> ${targetNode.label} (${sourceNode.description || ""} | ${targetNode.description || ""})`,
+          title: row.title || row.source_url || "Knowledge Catalog graph source",
+          sourceUrl: row.source_url || "",
+          documentId: row.document_id || "",
+          sourceNode,
+          targetNode,
+          link: {
+            source: sourceNode.id,
+            target: targetNode.id,
+            relation,
+          },
+        };
+      });
   } catch (err: any) {
     console.error("BigQuery graph retrieval failed:", err.message);
     return [];
@@ -1461,9 +1760,9 @@ function extractKeywords(text: string): string[] {
     .filter(word => word.length > 3 && !stopwords.has(word));
 }
 
-function searchFallbackGraph(keywords: string[]): string[] {
+function searchFallbackGraph(keywords: string[]): RetrievedGraphTriple[] {
   if (keywords.length === 0) return [];
-  const triples: string[] = [];
+  const triplesByKey = new Map<string, RetrievedGraphTriple>();
   const selectedKeywords = keywords.slice(0, 2);
 
   for (const keyword of selectedKeywords) {
@@ -1483,11 +1782,23 @@ function searchFallbackGraph(keywords: string[]): string[] {
         link.relation.toLowerCase().includes(keyword);
         
       if (isMatch) {
-        triples.push(`[Memori Graf] ${sourceNode.label} -> ${link.relation} -> ${targetNode.label} (${sourceNode.description || ""} | ${targetNode.description || ""})`);
+        const key = `${sourceNode.id}::${link.relation}::${targetNode.id}`;
+        triplesByKey.set(key, {
+          text: `[Memori Graf] ${sourceNode.label} -> ${link.relation} -> ${targetNode.label} (${sourceNode.description || ""} | ${targetNode.description || ""})`,
+          title: "Memori Graf Lokal Mursyid AI",
+          sourceUrl: "",
+          sourceNode,
+          targetNode,
+          link: {
+            source: sourceNode.id,
+            target: targetNode.id,
+            relation: link.relation,
+          },
+        });
       }
     }
   }
-  return Array.from(new Set(triples)).slice(0, 10);
+  return Array.from(triplesByKey.values()).slice(0, 10);
 }
 
 function mergeGraphIntoMemory(graphData: GraphExtraction) {
@@ -1686,6 +1997,47 @@ async function ingestURLContent(url: string, ai: GoogleGenAI, source?: CrawlSour
 // API ENDPOINTS
 // ==========================================
 
+app.get("/api/session", async (req, res) => {
+  try {
+    const sessionId = getOrCreateSessionId(req, res);
+    const state = await readSessionState(sessionId);
+    const storage = (await getConnectedRedisClient()) ? "redis" : "memory";
+    res.json({
+      sessionId,
+      state,
+      storage,
+      ttlSeconds: SESSION_TTL_SECONDS,
+    });
+  } catch (error: any) {
+    console.error("Session Read Error:", error);
+    res.status(500).json({ error: error.message || "Gagal membaca sesi aplikasi." });
+  }
+});
+
+app.put("/api/session", async (req, res) => {
+  try {
+    const sessionId = getOrCreateSessionId(req, res);
+    const previous = await readSessionState(sessionId);
+    const state = sanitizeSessionState(req.body || {}, previous);
+    const storage = await writeSessionState(sessionId, state);
+    res.json({ success: true, sessionId, state, storage });
+  } catch (error: any) {
+    console.error("Session Write Error:", error);
+    res.status(500).json({ error: error.message || "Gagal menyimpan sesi aplikasi." });
+  }
+});
+
+app.post("/api/session/reset", async (req, res) => {
+  try {
+    const sessionId = getOrCreateSessionId(req, res);
+    const storage = await writeSessionState(sessionId, {});
+    res.json({ success: true, sessionId, state: {}, storage });
+  } catch (error: any) {
+    console.error("Session Reset Error:", error);
+    res.status(500).json({ error: error.message || "Gagal menetapkan semula sesi aplikasi." });
+  }
+});
+
 // 1. Chat endpoint with TRUE Hybrid GraphRAG Grounding & customized Shafi'i context
 app.post("/api/chat", async (req, res) => {
   try {
@@ -1704,68 +2056,72 @@ app.post("/api/chat", async (req, res) => {
       "Cakap dengan sandaran dalil yang jelas dari Al-Quran dan Al-Sunnah jika bersesuaian, dan nyatakan sumber rujukan fatwa secara eksplisit. " +
       "Apabila pengguna bertanyakan isu semasa, gunakan hanya keputusan mufti yang sah di Malaysia apabila rujukannya wujud dalam katalog pengetahuan.";
 
-	    // GCP-native grounded retrieval layer
-		    let groundedContext = "";
-		    let citations: Citation[] = [];
-		    const keywords = extractKeywords(message);
+    // GCP-native grounded retrieval layer
+    let groundedContext = "";
+    let citations: Citation[] = [];
+    let relevantGraph: GraphExtraction = emptyRelevantGraph();
+    const keywords = extractKeywords(message);
 
-		    if (isGcpNativeConfigured()) {
-	      try {
-	        console.log(`GCP Native Retrieval: BigQuery + Knowledge Catalog context search for: "${message}"`);
-		        const vectorChunks = filterRelevantChunks(await searchBigQueryVectorChunks(ai, message, 5), keywords).slice(0, 3);
-		        const graphTriples = filterRelevantTriples(await searchBigQueryGraphTriples(keywords), keywords);
+    if (isGcpNativeConfigured()) {
+      try {
+        console.log(`GCP Native Retrieval: BigQuery + Knowledge Catalog context search for: "${message}"`);
+        const vectorChunks = filterRelevantChunks(await searchBigQueryVectorChunks(ai, message, 5), keywords).slice(0, 3);
+        const graphTriples = filterRelevantTriples(await searchBigQueryGraphTriples(keywords), keywords);
 
-		        if (vectorChunks.length > 0 || graphTriples.length > 0) {
-		          groundedContext += "\n\nMAKLUMAT SAHIH DARIPADA BIGQUERY VECTOR SEARCH & KNOWLEDGE CATALOG MURSYID AI:\n";
-	          groundedContext += "==========================================================================\n";
-		          if (graphTriples.length > 0) {
-		            groundedContext += "ENTITI & HUBUNGAN ONTOLOGI SYARAK (KNOWLEDGE CATALOG / BIGQUERY GRAPH):\n";
-		            groundedContext += graphTriples.map(triple => triple.text).join("\n") + "\n\n";
-		            citations.push(...graphTriples.map(triple => ({
-		              title: triple.title || triple.sourceUrl || "Knowledge Catalog graph source",
-		              url: triple.sourceUrl,
-		              source: "knowledge-catalog-graph" as const,
-		              documentId: triple.documentId,
-		            })));
-		          }
-		          if (vectorChunks.length > 0) {
-		            groundedContext += "KERATAN TEKS PECAHAN (BIGQUERY VECTOR SEARCH):\n";
-		            groundedContext += vectorChunks.map((chunk, i) => {
-		              const sourceLabel = `${chunk.title || chunk.sourceUrl} (${chunk.sourceUrl})`;
-		              return `[Sumber Rencana ${i + 1} | ${sourceLabel} | document_id=${chunk.documentId} | chunk=${chunk.chunkIndex}]: ${chunk.content}`;
-		            }).join("\n") + "\n";
-		            citations.push(...vectorChunks.map(chunkCitation));
-		          }
-		        }
-	      } catch (gcpErr: any) {
-	        console.error("Failed to compile GCP-native grounding context:", gcpErr.message);
-		      }
-		    }
+        if (vectorChunks.length > 0 || graphTriples.length > 0) {
+          groundedContext += "\n\nMAKLUMAT SAHIH DARIPADA BIGQUERY VECTOR SEARCH & KNOWLEDGE CATALOG MURSYID AI:\n";
+          groundedContext += "==========================================================================\n";
+          if (graphTriples.length > 0) {
+            groundedContext += "ENTITI & HUBUNGAN ONTOLOGI SYARAK (KNOWLEDGE CATALOG / BIGQUERY GRAPH):\n";
+            groundedContext += graphTriples.map(triple => triple.text).join("\n") + "\n\n";
+            relevantGraph = graphFromRetrievedTriples(graphTriples);
+            citations.push(...graphTriples.map(triple => ({
+              title: triple.title || triple.sourceUrl || "Knowledge Catalog graph source",
+              url: triple.sourceUrl,
+              source: "knowledge-catalog-graph" as const,
+              documentId: triple.documentId,
+            })));
+          }
+          if (vectorChunks.length > 0) {
+            groundedContext += "KERATAN TEKS PECAHAN (BIGQUERY VECTOR SEARCH):\n";
+            groundedContext += vectorChunks.map((chunk, i) => {
+              const sourceLabel = `${chunk.title || chunk.sourceUrl} (${chunk.sourceUrl})`;
+              return `[Sumber Rencana ${i + 1} | ${sourceLabel} | document_id=${chunk.documentId} | chunk=${chunk.chunkIndex}]: ${chunk.content}`;
+            }).join("\n") + "\n";
+            citations.push(...vectorChunks.map(chunkCitation));
+          }
+        }
+      } catch (gcpErr: any) {
+        console.error("Failed to compile GCP-native grounding context:", gcpErr.message);
+      }
+    }
 
-	    if (isGcpNativeConfigured() && !groundedContext) {
-	      return res.json({
-	        text:
-	          "Katalog pengetahuan Mursyid (BigQuery/Knowledge Catalog) tidak memulangkan konteks yang cukup relevan untuk soalan ini. " +
-	          "Saya tidak akan membuat kesimpulan hukum khusus atau mereka-reka rujukan di luar korpus yang telah diimbas. " +
-	          "Sila imbas portal rasmi berkaitan dahulu, kemudian tanya semula supaya jawapan boleh disandarkan kepada sumber yang mempunyai metadata dan sitasi.",
-	        citations: [],
-	      });
-	    }
-	
-	    // In-memory GraphRAG fallback for local/offline development.
-		    if (!groundedContext && keywords.length > 0) {
-		      const memoryTriples = searchFallbackGraph(keywords);
-		      if (memoryTriples.length > 0) {
-	        groundedContext += "\n\nMAKLUMAT GRAPHRAG ASAS DARIPADA MEMORI LOKAL MURSYID AI:\n";
-	        groundedContext += "=========================================================\n";
-	        groundedContext += "ENTITI & HUBUNGAN ONTOLOGI SYARAK (LOCAL MEMORY):\n";
-	        groundedContext += memoryTriples.join("\n") + "\n";
-	      }
-	    }
-	    citations = dedupeCitations(citations);
+    if (isGcpNativeConfigured() && !groundedContext) {
+      return res.json({
+        text:
+          "Katalog pengetahuan Mursyid (BigQuery/Knowledge Catalog) tidak memulangkan konteks yang cukup relevan untuk soalan ini. " +
+          "Saya tidak akan membuat kesimpulan hukum khusus atau mereka-reka rujukan di luar korpus yang telah diimbas. " +
+          "Sila imbas portal rasmi berkaitan dahulu, kemudian tanya semula supaya jawapan boleh disandarkan kepada sumber yang mempunyai metadata dan sitasi.",
+        citations: [],
+        relevantGraph: emptyRelevantGraph(),
+      });
+    }
 
-	    // Append our grounding context block directly into the Gemini instructions
-	    const finalSystemInstruction = systemInstruction + (groundedContext ? `\n\nSila berikan keutamaan tertinggi kepada data rujukan di bawah untuk menyusun hujah jawapan anda. Jangan gunakan carian web umum sebagai sumber utama; gunakan hanya konteks BigQuery Vector Search dan Knowledge Catalog/BigQuery Graph di bawah apabila tersedia. Apabila merujuk sumber, sebut nama portal/tajuk yang muncul dalam konteks. Jika konteks tidak mengandungi jawapan khusus yang ditanya, nyatakan dengan jelas bahawa katalog pengetahuan Mursyid belum mempunyai rujukan mencukupi untuk isu tersebut dan jangan reka keputusan fatwa atau URL.\n${groundedContext}` : "\n\nKatalog pengetahuan BigQuery/Knowledge Catalog tidak memulangkan konteks yang cukup relevan untuk soalan ini. Jangan gunakan carian web umum. Jika menjawab, nyatakan batasan ini dengan jelas dan minta pengguna mengimbas portal rasmi berkaitan sebelum membuat kesimpulan hukum khusus.");
+    // In-memory GraphRAG fallback for local/offline development.
+    if (!groundedContext && keywords.length > 0) {
+      const memoryTriples = searchFallbackGraph(keywords);
+      if (memoryTriples.length > 0) {
+        groundedContext += "\n\nMAKLUMAT GRAPHRAG ASAS DARIPADA MEMORI LOKAL MURSYID AI:\n";
+        groundedContext += "=========================================================\n";
+        groundedContext += "ENTITI & HUBUNGAN ONTOLOGI SYARAK (LOCAL MEMORY):\n";
+        groundedContext += memoryTriples.map(triple => triple.text).join("\n") + "\n";
+        relevantGraph = graphFromRetrievedTriples(memoryTriples);
+      }
+    }
+    citations = dedupeCitations(citations);
+
+    // Append our grounding context block directly into the Gemini instructions
+    const finalSystemInstruction = systemInstruction + (groundedContext ? `\n\nSila berikan keutamaan tertinggi kepada data rujukan di bawah untuk menyusun hujah jawapan anda. Jangan gunakan carian web umum sebagai sumber utama; gunakan hanya konteks BigQuery Vector Search dan Knowledge Catalog/BigQuery Graph di bawah apabila tersedia. Apabila merujuk sumber, sebut nama portal/tajuk yang muncul dalam konteks. Jika konteks tidak mengandungi jawapan khusus yang ditanya, nyatakan dengan jelas bahawa katalog pengetahuan Mursyid belum mempunyai rujukan mencukupi untuk isu tersebut dan jangan reka keputusan fatwa atau URL.\n${groundedContext}` : "\n\nKatalog pengetahuan BigQuery/Knowledge Catalog tidak memulangkan konteks yang cukup relevan untuk soalan ini. Jangan gunakan carian web umum. Jika menjawab, nyatakan batasan ini dengan jelas dan minta pengguna mengimbas portal rasmi berkaitan sebelum membuat kesimpulan hukum khusus.");
 
     const formattedHistory = (history || []).map((h: any) => ({
       role: h.role === "user" ? "user" : "model",
@@ -1774,18 +2130,18 @@ app.post("/api/chat", async (req, res) => {
 
     const contents = [...formattedHistory, { role: "user", parts: [{ text: message }] }];
 
-	    const response = await ai.models.generateContent({
-	      model: CHAT_MODEL,
-	      contents,
-	      config: {
-	        systemInstruction: finalSystemInstruction,
-	        temperature: 0.15, // Extremely low temperature to enforce strict adherence to groundings
-	      }
-	    });
-	
-	    const text = response.text || "Maaf, tiada jawapan dijana.";
-	
-	    res.json({ text, citations });
+    const response = await ai.models.generateContent({
+      model: CHAT_MODEL,
+      contents,
+      config: {
+        systemInstruction: finalSystemInstruction,
+        temperature: 0.15, // Extremely low temperature to enforce strict adherence to groundings
+      }
+    });
+
+    const text = response.text || "Maaf, tiada jawapan dijana.";
+
+    res.json({ text, citations, relevantGraph });
   } catch (error: any) {
     console.error("Chat Error:", error);
     res.status(500).json({ 

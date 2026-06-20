@@ -7,11 +7,15 @@ export interface ChatMessage {
     title: string;
     url: string;
   }[];
+  relevantGraph?: {
+    nodes: KnowledgeNode[];
+    links: KnowledgeLink[];
+  };
 }
 
 export interface KnowledgeNode {
   id: string;
-  type: "Konsep" | "Hukum" | "Sumber" | "Mazhab" | "Institusi" | "Artikkel";
+  type: "Konsep" | "Hukum" | "Sumber" | "Mazhab" | "Institusi" | "Artikkel" | "Entity";
   label: string;
   description: string;
   // properties added for D3 force layout
@@ -40,4 +44,13 @@ export interface PresetQuestion {
   question: string;
   category: string;
   shortLabel: string;
+}
+
+export interface PersistedAppState {
+  activeTab?: "chat" | "graph" | "sources" | "engineering";
+  graphSubTab?: "visualize" | "ingest";
+  isAgentInfoOpen?: boolean;
+  selectedNodeId?: string | null;
+  userInput?: string;
+  chatMessages?: ChatMessage[];
 }

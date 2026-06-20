@@ -4,15 +4,13 @@ import {
   Play, 
   Loader2, 
   CheckCircle2, 
-  XCircle, 
-  Activity, 
-  FileText, 
   ExternalLink,
-  ChevronRight,
-  Database,
   Layers,
   Sparkles,
-  Server
+  Search,
+  RefreshCw,
+  AlertCircle,
+  Clock3
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
@@ -65,6 +63,46 @@ const PRIMARY_PORTALS = [
   { name: "Mufti WP - Irsyad Al-Hadith", url: "https://muftiwp.gov.my/ms/artikel/irsyad-al-hadith", category: "Hadis" },
   { name: "Mufti WP - Al-Kafi li al-Fatawi", url: "https://muftiwp.gov.my/ms/artikel/al-kafi-li-al-fatawi", category: "Soal Jawab" }
 ];
+
+type PortalIndexStatus = "indexed" | "crawling" | "failed" | "waiting";
+
+function isStoredStatus(status?: string) {
+  if (!status) return false;
+  return !status.toUpperCase().startsWith("SKIPPED") && !status.toUpperCase().includes("NOT_CONFIGURED");
+}
+
+function statusTone(status: PortalIndexStatus) {
+  switch (status) {
+    case "indexed":
+      return {
+        dot: "bg-emerald-500",
+        ring: "ring-emerald-100",
+        text: "text-emerald-700",
+        label: "Indexed"
+      };
+    case "crawling":
+      return {
+        dot: "bg-amber-400 animate-pulse",
+        ring: "ring-amber-100",
+        text: "text-amber-700",
+        label: "Crawling"
+      };
+    case "failed":
+      return {
+        dot: "bg-rose-500",
+        ring: "ring-rose-100",
+        text: "text-rose-700",
+        label: "Failed"
+      };
+    default:
+      return {
+        dot: "bg-[#C8C2B5]",
+        ring: "ring-[#EAE7DF]",
+        text: "text-[#8A8478]",
+        label: "Waiting"
+      };
+  }
+}
 
 export function CrawlerPanel({ onIndexComplete, setError }: CrawlerPanelProps) {
   const [singleUrl, setSingleUrl] = useState("");
@@ -199,61 +237,86 @@ export function CrawlerPanel({ onIndexComplete, setError }: CrawlerPanelProps) {
   const completedCount = crawlLogs.filter(log => log.status === "SUCCESS" || log.status === "FAILED").length;
   const runningUrl = crawlLogs.find(log => log.status === "RUNNING")?.url || "";
   const progressPercent = totalSources > 0 ? (completedCount / totalSources) * 100 : 0;
+  const indexedCount = crawlLogs.filter(log => log.status === "SUCCESS").length;
+  const failedCount = crawlLogs.filter(log => log.status === "FAILED").length;
+  const latestLogs = [...crawlLogs].slice(-4).reverse();
+
+  const getPortalLog = (portalUrl: string) => {
+    const normalizedPortalUrl = portalUrl.replace(/\/$/, "");
+    return [...crawlLogs].reverse().find((log) => {
+      const normalizedLogUrl = log.url.replace(/\/$/, "");
+      return normalizedLogUrl === normalizedPortalUrl || normalizedLogUrl.startsWith(normalizedPortalUrl);
+    });
+  };
+
+  const getPortalStatus = (portalUrl: string): PortalIndexStatus => {
+    const log = getPortalLog(portalUrl);
+    if (!log) return "waiting";
+    if (log.status === "RUNNING") return "crawling";
+    if (log.status === "FAILED") return "failed";
+    return "indexed";
+  };
 
   return (
-    <div className="space-y-6 text-left">
-      
-      {/* Banner / Intro */}
-      <div className="p-4 rounded-2xl border border-[#E5E1D8] bg-[#F9F7F2]/50 text-xs text-[#5A564E] leading-relaxed shadow-inner flex items-start gap-3">
-        <div className="w-8 h-8 rounded-xl bg-[#5A634A]/10 flex items-center justify-center shrink-0 mt-0.5 border border-[#5A634A]/15">
-          <Database className="w-4 h-4 text-[#5A634A]" />
+    <div className="space-y-5 text-left">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="rounded-xl border border-[#E5E1D8] bg-[#FDFBF7] p-4 shadow-sm">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-[#8A8478]">Indexed</span>
+            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 ring-4 ring-emerald-100" />
+          </div>
+          <p className="mt-2 text-2xl font-serif font-bold text-[#2D2B26]">{indexedCount}</p>
+          <p className="text-[11px] text-[#8A8478]">of {totalSources} portals</p>
         </div>
-        <div>
-          <span className="text-[#5A634A] font-serif font-bold uppercase tracking-wider text-[10px] block mb-0.5">
-            Crawl4AI, BigQuery & Knowledge Catalog
-          </span>
-          Sistem merayap 10 portal rujukan, menyimpan snapshot Markdown ke Cloud Storage, mengisi BigQuery Vector Search, dan menerbitkan konteks ke Knowledge Catalog.
+        <div className="rounded-xl border border-[#E5E1D8] bg-[#FDFBF7] p-4 shadow-sm">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-[#8A8478]">Status</span>
+            <span className={`w-2.5 h-2.5 rounded-full ring-4 ${isBatchCrawling ? "bg-amber-400 ring-amber-100 animate-pulse" : "bg-[#C8C2B5] ring-[#EAE7DF]"}`} />
+          </div>
+          <p className="mt-2 text-2xl font-serif font-bold text-[#2D2B26]">{isBatchCrawling ? "Active" : "Idle"}</p>
+          <p className="text-[11px] text-[#8A8478]">{completedCount} completed</p>
+        </div>
+        <div className="rounded-xl border border-[#E5E1D8] bg-[#FDFBF7] p-4 shadow-sm">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-[#8A8478]">Issues</span>
+            <AlertCircle className={`w-4 h-4 ${failedCount ? "text-rose-600" : "text-[#C8C2B5]"}`} />
+          </div>
+          <p className="mt-2 text-2xl font-serif font-bold text-[#2D2B26]">{failedCount}</p>
+          <p className="text-[11px] text-[#8A8478]">failed crawls</p>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        
-        {/* Left Column: Manual URL Indexing & Batch Action (Takes 5 cols) */}
-        <div className="lg:col-span-5 space-y-6">
-          
-          {/* Section 1: Single URL Crawler Form */}
-          <div className="p-5 rounded-2xl border border-[#E5E1D8] bg-[#FDFBF7] shadow-sm space-y-4">
-            <h5 className="font-serif font-bold text-sm text-[#2D2B26] flex items-center gap-2 border-b border-[#E5E1D8]/60 pb-3">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+        <div className="lg:col-span-4 space-y-4">
+          <div className="p-4 rounded-xl border border-[#E5E1D8] bg-[#FDFBF7] shadow-sm space-y-4">
+            <h5 className="font-serif font-bold text-sm text-[#2D2B26] flex items-center gap-2">
               <Globe className="w-4 h-4 text-[#5A634A]" />
               Indeks URL Tunggal
             </h5>
             
             <form onSubmit={handleSingleCrawl} className="space-y-3">
               <div className="space-y-1.5">
-                <label className="text-[10px] uppercase tracking-wider font-bold text-[#8A8478] font-serif block">
-                  URL Artikel / Fatwa Fiqh:
-                </label>
                 <div className="flex gap-2">
                   <input
                     type="url"
                     value={singleUrl}
                     onChange={(e) => setSingleUrl(e.target.value)}
                     placeholder="https://muftiwp.gov.my/..."
-                    className="flex-1 px-3 py-2 rounded-xl border border-[#E5E1D8] bg-[#F9F7F2]/30 text-xs text-[#3D3B36] focus:outline-none focus:ring-1 focus:ring-[#5A634A] focus:border-[#5A634A] transition-all"
+                    className="min-w-0 flex-1 px-3 py-2.5 rounded-lg border border-[#E5E1D8] bg-white text-xs text-[#3D3B36] focus:outline-none focus:ring-1 focus:ring-[#5A634A] focus:border-[#5A634A] transition-all"
                     disabled={isSingleLoading}
                     required
                   />
                   <button
                     type="submit"
                     disabled={isSingleLoading || !singleUrl.trim()}
-                    className="px-4 py-2 bg-[#5A634A] hover:bg-[#5A634A]/90 disabled:bg-[#EAE7DF] disabled:text-[#8A8478] text-[#FDFBF7] text-xs font-bold rounded-xl shadow-sm hover:shadow active:scale-95 transition-all cursor-pointer flex items-center gap-1.5 shrink-0"
+                    className="px-3 py-2.5 bg-[#5A634A] hover:bg-[#5A634A]/90 disabled:bg-[#EAE7DF] disabled:text-[#8A8478] text-[#FDFBF7] text-xs font-bold rounded-lg shadow-sm hover:shadow active:scale-95 transition-all cursor-pointer flex items-center gap-1.5 shrink-0"
+                    title="Index URL"
                   >
                     {isSingleLoading ? (
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
                     ) : (
                       <Sparkles className="w-3.5 h-3.5" />
                     )}
-                    Indeks
                   </button>
                 </div>
               </div>
@@ -265,7 +328,7 @@ export function CrawlerPanel({ onIndexComplete, setError }: CrawlerPanelProps) {
                   initial={{ opacity: 0, height: 0 }}
                   animate={{ opacity: 1, height: "auto" }}
                   exit={{ opacity: 0, height: 0 }}
-                  className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl text-xs leading-relaxed space-y-2.5 text-left"
+                  className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-lg text-xs leading-relaxed space-y-2.5 text-left"
                 >
                   <div className="flex items-center gap-1.5 font-bold">
                     <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
@@ -273,27 +336,29 @@ export function CrawlerPanel({ onIndexComplete, setError }: CrawlerPanelProps) {
                   </div>
                   {singleStats && (
                     <>
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-emerald-100 text-[9px] font-mono text-[#5A564E] font-bold">
-                        <div className="bg-[#FDFBF7] p-2 rounded-lg border border-emerald-200/50 text-center shadow-inner">
+                      <div className="grid grid-cols-2 gap-2 pt-2 border-t border-emerald-100 text-[9px] font-mono text-[#5A564E] font-bold">
+                        <div className="bg-[#FDFBF7] p-2 rounded-md border border-emerald-200/50 text-center shadow-inner">
                           <span className="block font-extrabold text-[#5A634A] text-sm mb-0.5">{singleStats.documentsCount || 1}</span>
                           Dokumen
                         </div>
-                        <div className="bg-[#FDFBF7] p-2 rounded-lg border border-emerald-200/50 text-center shadow-inner">
+                        <div className="bg-[#FDFBF7] p-2 rounded-md border border-emerald-200/50 text-center shadow-inner">
                           <span className="block font-extrabold text-[#5A634A] text-sm mb-0.5">{singleStats.chunksCount}</span>
                           Chunks
                         </div>
-                        <div className="bg-[#FDFBF7] p-2 rounded-lg border border-emerald-200/50 text-center shadow-inner">
+                        <div className="bg-[#FDFBF7] p-2 rounded-md border border-emerald-200/50 text-center shadow-inner">
                           <span className="block font-extrabold text-[#A48F68] text-sm mb-0.5">{singleStats.nodesCount}</span>
                           Nodes
                         </div>
-                        <div className="bg-[#FDFBF7] p-2 rounded-lg border border-emerald-200/50 text-center shadow-inner">
+                        <div className="bg-[#FDFBF7] p-2 rounded-md border border-emerald-200/50 text-center shadow-inner">
                           <span className="block font-extrabold text-slate-600 text-sm mb-0.5">{singleStats.linksCount}</span>
                           Edges
                         </div>
                       </div>
-                      <p className="text-[10px] text-emerald-700 font-mono">
-                        Crawler: {singleStats.crawler || "crawl4ai"} | BQ: {singleStats.bigQueryStatus || "SKIPPED_NOT_CONFIGURED"} | Catalog: {singleStats.knowledgeCatalogStatus || "SKIPPED_NOT_CONFIGURED"} | GCS: {singleStats.gcsStatus || "SKIPPED_NOT_CONFIGURED"}
-                      </p>
+                      <div className="flex flex-wrap gap-1.5 text-[9px] font-bold">
+                        <span className={`px-2 py-1 rounded-full ${isStoredStatus(singleStats.bigQueryStatus) ? "bg-emerald-100 text-emerald-700" : "bg-[#EAE7DF] text-[#8A8478]"}`}>BigQuery</span>
+                        <span className={`px-2 py-1 rounded-full ${isStoredStatus(singleStats.knowledgeCatalogStatus) ? "bg-emerald-100 text-emerald-700" : "bg-[#EAE7DF] text-[#8A8478]"}`}>Catalog</span>
+                        <span className={`px-2 py-1 rounded-full ${isStoredStatus(singleStats.gcsStatus) ? "bg-emerald-100 text-emerald-700" : "bg-[#EAE7DF] text-[#8A8478]"}`}>Storage</span>
+                      </div>
                     </>
                   )}
                 </motion.div>
@@ -301,20 +366,16 @@ export function CrawlerPanel({ onIndexComplete, setError }: CrawlerPanelProps) {
             </AnimatePresence>
           </div>
 
-          {/* Section 2: Batch Indexing Action Card */}
-          <div className="p-5 rounded-2xl border border-[#E5E1D8] bg-[#FDFBF7] shadow-sm space-y-4">
-            <h5 className="font-serif font-bold text-sm text-[#2D2B26] flex items-center gap-2 border-b border-[#E5E1D8]/60 pb-3">
+          <div className="p-4 rounded-xl border border-[#E5E1D8] bg-[#FDFBF7] shadow-sm space-y-4">
+            <h5 className="font-serif font-bold text-sm text-[#2D2B26] flex items-center gap-2">
               <Layers className="w-4 h-4 text-[#A48F68]" />
               Ingestasi Batch
             </h5>
-            <p className="text-[11px] text-[#5A564E] leading-relaxed">
-              Memproses 10 portal rujukan secara berjujukan di pelayan latar belakang supaya tapak luar tidak dibanjiri permintaan.
-            </p>
 
             <button
               onClick={handleBatchCrawl}
               disabled={isBatchCrawling}
-              className={`w-full py-3 rounded-xl text-xs font-bold tracking-wider flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer ${
+              className={`w-full py-3 rounded-lg text-xs font-bold tracking-wider flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer ${
                 isBatchCrawling 
                   ? "bg-[#EAE7DF] text-[#8A8478] cursor-not-allowed border border-[#D4D0C6]" 
                   : "bg-[#5A634A] hover:bg-[#5A634A]/90 text-white border border-transparent hover:shadow active:scale-[0.99]"
@@ -333,29 +394,26 @@ export function CrawlerPanel({ onIndexComplete, setError }: CrawlerPanelProps) {
               )}
             </button>
 
-            {/* Ingress status progress */}
-            {isBatchCrawling && (
-              <div className="space-y-2 bg-[#F9F7F2] p-3.5 rounded-xl border border-[#E5E1D8] text-xs">
-                <div className="flex justify-between font-bold text-[9px] text-[#8A8478] uppercase tracking-wider">
-                  <span>Status Kemajuan:</span>
-                  <span>{completedCount} / {totalSources} Selesai</span>
-                </div>
-                <div className="w-full h-2 bg-[#EAE7DF] rounded-full overflow-hidden shadow-inner">
-                  <div 
-                    className="h-full bg-gradient-to-r from-[#5A634A] via-[#8B9474] to-[#A48F68] transition-all duration-500 rounded-full" 
-                    style={{ width: `${progressPercent}%` }}
-                  />
-                </div>
-                {runningUrl && (
-                  <p className="text-[10px] text-[#8A8478] mt-1 italic truncate">
-                    Sedang merayap: <span className="text-[#5A634A] font-semibold">{runningUrl}</span>
-                  </p>
-                )}
+            <div className="space-y-2">
+              <div className="flex justify-between font-bold text-[10px] text-[#8A8478] uppercase tracking-wider">
+                <span>Kemajuan</span>
+                <span>{completedCount} / {totalSources}</span>
               </div>
-            )}
+              <div className="w-full h-2 bg-[#EAE7DF] rounded-full overflow-hidden shadow-inner">
+                <div 
+                  className="h-full bg-[#5A634A] transition-all duration-500 rounded-full" 
+                  style={{ width: `${progressPercent}%` }}
+                />
+              </div>
+              {runningUrl && (
+                <p className="text-[10px] text-[#8A8478] truncate">
+                  <span className="text-[#5A634A] font-semibold">Aktif:</span> {runningUrl}
+                </p>
+              )}
+            </div>
 
             {successMsg && (
-              <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl text-[11px] leading-relaxed text-left flex items-center gap-2">
+              <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-lg text-[11px] leading-relaxed text-left flex items-center gap-2">
                 <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                 <span className="font-semibold">{successMsg}</span>
               </div>
@@ -363,114 +421,118 @@ export function CrawlerPanel({ onIndexComplete, setError }: CrawlerPanelProps) {
           </div>
         </div>
 
-        {/* Right Column: Portal Directories & Live Log Monitor (Takes 7 cols) */}
-        <div className="lg:col-span-7 flex flex-col gap-4">
-          
-          {/* Top of Right Column: Directory of Registered Portals */}
-          <div className="p-4 rounded-2xl border border-[#E5E1D8] bg-[#FDFBF7] shadow-sm space-y-3">
-            <h5 className="font-serif font-bold text-xs uppercase tracking-wider text-[#8A8478] flex items-center gap-1.5">
-              <Server className="w-3.5 h-3.5 text-[#5A634A]" />
-              Direktori 10 Portal Berdaftar
+        <div className="lg:col-span-8 space-y-4">
+          <div className="p-4 rounded-xl border border-[#E5E1D8] bg-[#FDFBF7] shadow-sm space-y-3">
+            <h5 className="font-serif font-bold text-sm text-[#2D2B26] flex items-center gap-2">
+              <Search className="w-4 h-4 text-[#5A634A]" />
+              Portal Berdaftar
             </h5>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-left">
-              {PRIMARY_PORTALS.map((portal, idx) => (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-left">
+              {PRIMARY_PORTALS.map((portal, idx) => {
+                const log = getPortalLog(portal.url);
+                const portalStatus = getPortalStatus(portal.url);
+                const tone = statusTone(portalStatus);
+
+                return (
                 <div 
                   key={idx} 
-                  className="p-2.5 bg-[#F9F7F2]/50 rounded-xl border border-[#E5E1D8]/60 flex items-center justify-between text-xs hover:border-[#5A634A]/50 hover:bg-white hover:shadow-sm transition-all"
+                  className="p-3 bg-white rounded-lg border border-[#E5E1D8]/80 flex items-center justify-between text-xs hover:border-[#5A634A]/50 hover:shadow-sm transition-all"
                 >
-                  <div className="min-w-0 pr-2 space-y-0.5">
-                    <span className="text-[8px] font-extrabold uppercase text-[#A48F68] px-2 py-0.5 rounded-full bg-[#EAE7DF] border border-[#D4D0C6] inline-block">
-                      {portal.category}
-                    </span>
-                    <h6 className="font-bold text-[#2D2B26] truncate">{portal.name}</h6>
-                    <p className="text-[9px] text-[#8A8478] truncate font-mono">{portal.url}</p>
+                  <div className="min-w-0 pr-3">
+                    <div className="flex items-center gap-2">
+                      <span className={`w-2.5 h-2.5 rounded-full ring-4 shrink-0 ${tone.dot} ${tone.ring}`} />
+                      <h6 className="font-bold text-[#2D2B26] truncate">{portal.name}</h6>
+                    </div>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5 pl-6">
+                      <span className="text-[9px] font-bold uppercase tracking-wide text-[#A48F68] bg-[#F5F1E9] px-1.5 py-0.5 rounded">
+                        {portal.category}
+                      </span>
+                      <span className={`text-[9px] font-bold uppercase tracking-wide ${tone.text}`}>
+                        {tone.label}
+                      </span>
+                      {log?.status === "SUCCESS" && (
+                        <>
+                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${isStoredStatus(log.bigQueryStatus) ? "bg-emerald-50 text-emerald-700" : "bg-[#F1F0EC] text-[#8A8478]"}`}>BQ</span>
+                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${isStoredStatus(log.knowledgeCatalogStatus) ? "bg-emerald-50 text-emerald-700" : "bg-[#F1F0EC] text-[#8A8478]"}`}>Catalog</span>
+                        </>
+                      )}
+                    </div>
                   </div>
                   <a 
                     href={portal.url} 
                     target="_blank" 
                     rel="noopener noreferrer" 
-                    className="p-2 hover:bg-[#EAE7DF] rounded-xl text-[#8A8478] hover:text-[#5A634A] transition-colors shrink-0 border border-transparent hover:border-[#D4D0C6]"
+                    className="p-2 hover:bg-[#EAE7DF] rounded-lg text-[#8A8478] hover:text-[#5A634A] transition-colors shrink-0 border border-transparent hover:border-[#D4D0C6]"
+                    title="Open portal"
                   >
                     <ExternalLink className="w-3.5 h-3.5" />
                   </a>
                 </div>
-              ))}
+              )})}
             </div>
           </div>
 
-          {/* Bottom of Right Column: Real-time Live Logs Console */}
-          <div className="flex-1 p-4 rounded-2xl border border-[#3D3831] bg-[#141413] text-[#FDFBF7] shadow-xl flex flex-col min-h-[300px]">
-            <div className="flex items-center justify-between border-b border-[#2C2822] pb-3 mb-4 shrink-0">
-              <div className="flex items-center gap-2">
-                <span className={`w-2 h-2 rounded-full inline-block ${isBatchCrawling ? "bg-amber-400 animate-pulse" : "bg-emerald-400"}`} />
-                <h5 className="font-serif font-bold text-xs text-[#E5E1D8] flex items-center gap-1.5">
-                  <Activity className="w-3.5 h-3.5 text-amber-400" />
-                  Konsol Terminal Live
-                </h5>
-              </div>
-              <span className="text-[8px] font-mono text-[#8A8478] bg-[#22201B] border border-[#3D3831] px-2.5 py-1 rounded-full font-bold">
-                STATUS: {isBatchCrawling ? "CRAWLING" : "IDLE"}
+          <div className="p-4 rounded-xl border border-[#E5E1D8] bg-[#FDFBF7] shadow-sm space-y-3">
+            <div className="flex items-center justify-between">
+              <h5 className="font-serif font-bold text-sm text-[#2D2B26] flex items-center gap-2">
+                <RefreshCw className={`w-4 h-4 text-[#5A634A] ${isBatchCrawling ? "animate-spin" : ""}`} />
+                Aktiviti Terkini
+              </h5>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-[#8A8478]">
+                {crawlLogs.length} rekod
               </span>
             </div>
 
-            {/* Console Log Lines */}
-            <div className="flex-1 overflow-y-auto space-y-2.5 font-mono text-[10px] leading-relaxed custom-scrollbar max-h-[280px] text-left pr-1">
-              {crawlLogs.length === 0 ? (
-                <div className="h-full flex items-center justify-center text-[#8A8478] italic text-xs">
-                  Sedia. Cetusan batch crawling untuk melihat maklumat penganalisisan.
+            <div className="space-y-2 max-h-[260px] overflow-y-auto custom-scrollbar pr-1">
+              {latestLogs.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-[#D4D0C6] bg-[#F9F7F2]/70 p-5 text-center text-xs text-[#8A8478]">
+                  Tiada aktiviti lagi.
                 </div>
               ) : (
-                crawlLogs.map((log, index) => (
-                  <div key={index} className="p-3 rounded-xl bg-[#1C1B18] border border-[#2D2821] space-y-1.5 shadow-inner">
-                    <div className="flex justify-between items-center text-[9px] border-b border-[#2D2821] pb-1.5 text-[#8A8478]">
-                      <span className="truncate max-w-[70%] font-bold text-[#E5E1D8]">{log.sourceName || log.title}</span>
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        <span>{log.time}</span>
-                        {log.status === "RUNNING" && (
-                          <span className="px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 text-[7px] font-extrabold animate-pulse">RUNNING</span>
-                        )}
-                        {log.status === "SUCCESS" && (
-                          <span className="px-1.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[7px] font-extrabold">SUCCESS</span>
-                        )}
-                        {log.status === "FAILED" && (
-                          <span className="px-1.5 py-0.5 rounded-full bg-rose-500/10 text-rose-400 border border-rose-500/20 text-[7px] font-extrabold font-mono">FAILED</span>
-                        )}
+                latestLogs.map((log, index) => {
+                  const logStatus: PortalIndexStatus =
+                    log.status === "RUNNING" ? "crawling" : log.status === "FAILED" ? "failed" : "indexed";
+                  const tone = statusTone(logStatus);
+
+                  return (
+                  <div key={index} className="rounded-lg border border-[#E5E1D8] bg-white p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className={`w-2.5 h-2.5 rounded-full ring-4 shrink-0 ${tone.dot} ${tone.ring}`} />
+                          <h6 className="font-bold text-xs text-[#2D2B26] truncate">{log.sourceName || log.title}</h6>
+                        </div>
+                        <p className="mt-1 pl-6 text-[10px] text-[#8A8478] truncate">{log.url}</p>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0 text-[10px] text-[#8A8478]">
+                        <Clock3 className="w-3.5 h-3.5" />
+                        {log.time}
                       </div>
                     </div>
-                    {log.sourceName && (
-                      <p className="text-[#E5E1D8] font-sans text-[11px] leading-relaxed">{log.title}</p>
-                    )}
-                    <p className="text-[#A48F68] break-all opacity-90 select-all">{log.url}</p>
-                    <p className="text-[#D4D0C6] font-sans text-xs leading-relaxed opacity-95">{log.log}</p>
-                    {(log.pagesCount || log.crawler || log.bigQueryStatus || log.knowledgeCatalogStatus || log.gcsStatus) && (
-                      <div className="flex flex-wrap gap-1.5 pt-1 text-[8px] uppercase tracking-wider font-extrabold">
+                    <p className="mt-2 text-[11px] text-[#5A564E] leading-relaxed">{log.log}</p>
+                    {(log.pagesCount || log.bigQueryStatus || log.knowledgeCatalogStatus || log.gcsStatus) && (
+                      <div className="flex flex-wrap gap-1.5 pt-2 text-[9px] uppercase tracking-wider font-bold">
                         {log.pagesCount && (
-                          <span className="px-2 py-1 rounded-full bg-[#22201B] text-[#E5E1D8] border border-[#3D3831]">{log.pagesCount} dokumen</span>
-                        )}
-                        {log.crawler && (
-                          <span className="px-2 py-1 rounded-full bg-[#22201B] text-[#A48F68] border border-[#3D3831]">{log.crawler}</span>
+                          <span className="px-2 py-1 rounded-full bg-[#F5F1E9] text-[#6D685E]">{log.pagesCount} dokumen</span>
                         )}
                         {log.bigQueryStatus && (
-                          <span className="px-2 py-1 rounded-full bg-[#22201B] text-sky-300 border border-[#3D3831]">BigQuery {log.bigQueryStatus}</span>
+                          <span className={`px-2 py-1 rounded-full ${isStoredStatus(log.bigQueryStatus) ? "bg-emerald-50 text-emerald-700" : "bg-[#F1F0EC] text-[#8A8478]"}`}>BigQuery</span>
                         )}
                         {log.knowledgeCatalogStatus && (
-                          <span className="px-2 py-1 rounded-full bg-[#22201B] text-emerald-300 border border-[#3D3831]">Catalog {log.knowledgeCatalogStatus}</span>
+                          <span className={`px-2 py-1 rounded-full ${isStoredStatus(log.knowledgeCatalogStatus) ? "bg-emerald-50 text-emerald-700" : "bg-[#F1F0EC] text-[#8A8478]"}`}>Catalog</span>
                         )}
                         {log.gcsStatus && (
-                          <span className="px-2 py-1 rounded-full bg-[#22201B] text-amber-300 border border-[#3D3831]">GCS {log.gcsStatus}</span>
+                          <span className={`px-2 py-1 rounded-full ${isStoredStatus(log.gcsStatus) ? "bg-emerald-50 text-emerald-700" : "bg-[#F1F0EC] text-[#8A8478]"}`}>Storage</span>
                         )}
                       </div>
                     )}
                   </div>
-                ))
+                )})
               )}
             </div>
           </div>
-
         </div>
-
       </div>
-
     </div>
   );
 }

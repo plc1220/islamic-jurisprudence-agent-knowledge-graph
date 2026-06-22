@@ -14,7 +14,10 @@ graph LR
     SA["Cloud Run runtime service account"] --> CR
     CR --> C4AI["Crawl4AI + Chromium runtime"]
     CR --> GCS["Cloud Storage raw markdown"]
-    CR --> BQ["BigQuery corpus, chunks, graph edges"]
+    JOB["Cloud Run Job backfill"] --> GCS
+    JOB --> BQLOAD["BigQuery staging load jobs"]
+    BQLOAD --> BQ["BigQuery corpus, chunks, graph edges"]
+    CR --> BQ
     BQ --> BQVS["BigQuery Vector Search"]
     CR --> KC["Knowledge Catalog entries/aspects"]
     CR --> Vertex["Gemini / Vertex AI"]
@@ -41,9 +44,15 @@ Optional variables override workflow defaults:
 | `GCP_REGION` | `asia-southeast1` |
 | `ARTIFACT_REGISTRY_REPOSITORY` | `mursyid-repo` |
 | `CLOUD_RUN_SERVICE` | `mursyid-ai` |
+| `CLOUD_RUN_BACKFILL_JOB` | `mursyid-ai-backfill` |
 | `GCS_RAW_BUCKET` | `my-rd-coe-demo-gen-ai-mursyid-raw` |
 | `GEMINI_LOCATION` | `global` |
 | `BQ_DATASET` | `mursyid_knowledge` |
+| `BQ_CRAWL_ATTEMPTS_TABLE` | `crawl_attempts` |
+| `BACKFILL_MAX_CONCURRENCY` | `4` |
+| `BACKFILL_URL_LIMIT` | `0` |
+| `BACKFILL_DISCOVERY_DEPTH` | `2` |
+| `BACKFILL_PUBLISH_CATALOG` | `true` |
 
 To create or update the GitHub OIDC deploy identity, apply Terraform and copy the outputs into GitHub repository variables:
 
@@ -56,7 +65,7 @@ terraform output github_actions_deploy_service_account
 
 ## Cloud Build (Legacy Manual Path)
 
-`cloudbuild.yaml` builds the Docker image, pushes it to Artifact Registry, and deploys Cloud Run with production runtime configuration:
+`cloudbuild.yaml` builds the Docker image, pushes it to Artifact Registry, deploys the Cloud Run service, and deploys the large-backfill Cloud Run Job definition with production runtime configuration:
 
 - `NODE_ENV=production`
 - `GOOGLE_GENAI_USE_ENTERPRISE=true`
@@ -70,7 +79,26 @@ terraform output github_actions_deploy_service_account
 - `KNOWLEDGE_CATALOG_ENTRY_GROUP`, `KNOWLEDGE_CATALOG_ENTRY_TYPE`, `KNOWLEDGE_CATALOG_ASPECT_TYPE`
 - `MDCODE_EXPORT_DIR=/tmp/catalog-export`
 
-The Cloud Run deployment uses 2 CPU, 4Gi memory, one max instance, always-allocated CPU, and a 900 second timeout so `/api/ingest-batch` can continue background crawling after the request returns. The single-instance cap keeps the current in-memory crawl status stable until this is moved to a durable queue/job runner.
+The Cloud Run deployment uses 2 CPU, 4Gi memory, one max instance, always-allocated CPU, and a 900 second timeout so `/api/ingest-batch` can continue background crawling after the request returns. The single-instance cap keeps the current in-memory crawl status stable for small/manual crawls.
+
+Cloud Build also deploys a Cloud Run Job named `mursyid-ai-backfill` for large archive backfills. The job is deployed but not executed automatically.
+
+Run a full staged backfill:
+
+```bash
+gcloud run jobs execute mursyid-ai-backfill \
+  --region asia-southeast1 \
+  --wait
+```
+
+Run a constrained smoke backfill:
+
+```bash
+gcloud run jobs execute mursyid-ai-backfill \
+  --region asia-southeast1 \
+  --update-env-vars BACKFILL_URL_LIMIT=3,BACKFILL_DRY_RUN=false \
+  --wait
+```
 
 ## Terraform
 
@@ -110,8 +138,14 @@ gcloud builds submit \
 | `_BQ_CHUNKS_TABLE` | `chunks` | Chunk + embedding table used by vector search. |
 | `_BQ_GRAPH_TABLE` | `graph_edges` | Extracted graph edge table. |
 | `_BQ_CRAWL_RUNS_TABLE` | `crawl_runs` | Durable crawler run/pass records used by the status UI. |
+| `_BQ_CRAWL_ATTEMPTS_TABLE` | `crawl_attempts` | Per-URL large-backfill attempt/audit table. |
 | `_GCS_RAW_BUCKET` | empty | Cloud Storage bucket for markdown snapshots; set this for production. |
 | `_KNOWLEDGE_CATALOG_ENTRY_GROUP` | `mursyid-knowledge` | Custom Knowledge Catalog entry group. |
+| `_BACKFILL_JOB_NAME` | `mursyid-ai-backfill` | Cloud Run Job name for staged backfills. |
+| `_BACKFILL_MAX_CONCURRENCY` | `4` | Concurrent URL crawl/process workers inside the job. |
+| `_BACKFILL_URL_LIMIT` | `0` | Maximum URLs to process; `0` means all discovered URLs. |
+| `_BACKFILL_DISCOVERY_DEPTH` | `2` | HTML BFS depth for sources without complete sitemap/RSS coverage. |
+| `_BACKFILL_PUBLISH_CATALOG` | `true` | Whether changed/new documents publish Knowledge Catalog entries. |
 
 ## Runtime Flow
 
@@ -122,6 +156,16 @@ gcloud builds submit \
 5. BigQuery Vector Search retrieves grounded semantic chunks for `/api/chat`.
 6. Knowledge Catalog receives governed source and concept entries with custom aspects.
 7. A metadata-as-code export is written to `MDCODE_EXPORT_DIR` for review/debugging.
+
+## Large Backfill Runtime Flow
+
+1. The Cloud Run Job discovers source URLs through sitemaps, RSS feeds, and bounded HTML traversal.
+2. Discovery manifests are written to `gs://<GCS_RAW_BUCKET>/backfills/<runId>/discovery/`.
+3. Each changed/new document is crawled to raw markdown in `gs://<GCS_RAW_BUCKET>/raw/<source>/<documentId>/<contentHash>.md`.
+4. Corpus, chunk, graph, and attempt rows are written as sharded JSONL under `gs://<GCS_RAW_BUCKET>/backfills/<runId>/load/`.
+5. BigQuery load jobs write those JSONL shards into run-scoped staging tables.
+6. One BigQuery transaction merges staging rows into production tables and deletes obsolete chunks/graph edges for changed documents.
+7. `crawl_attempts` records URL-level statuses such as `DISCOVERED`, `SKIPPED_UNCHANGED`, `PREPARED`, `CATALOGED`, and `FAILED`.
 
 ## Local ADC Setup
 

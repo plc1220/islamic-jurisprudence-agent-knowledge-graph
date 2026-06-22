@@ -18,7 +18,7 @@ dotenv.config();
 // ==========================================
 let modelConfig = {
   CRAWLER_MODEL: "gemini-3.1-flash-lite",
-  CHAT_MODEL: "gemini-3.5-flash",
+  CHAT_MODEL: "gemini-3.1-flash-lite",
   EXTRACTOR_MODEL: "gemini-3.5-flash"
 };
 
@@ -174,6 +174,8 @@ type IngestStats = {
   nodesCount: number;
   linksCount: number;
   documentsCount: number;
+  skippedDocumentsCount?: number;
+  updatedDocumentsCount?: number;
   crawler: string;
   gcsStatus: GcpPipelineStatus;
   bigQueryStatus: GcpPipelineStatus;
@@ -839,6 +841,21 @@ function hashId(input: string, length: number = 16): string {
   return createHash("sha256").update(input).digest("hex").slice(0, length);
 }
 
+function normalizeDocumentUrl(value?: string): string {
+  if (!value) return "";
+  try {
+    const parsed = new URL(value);
+    parsed.hash = "";
+    parsed.protocol = parsed.protocol.toLowerCase();
+    parsed.hostname = parsed.hostname.toLowerCase();
+    parsed.searchParams.sort();
+    const normalized = parsed.toString();
+    return normalized.endsWith("/") && parsed.pathname !== "/" ? normalized.slice(0, -1) : normalized;
+  } catch {
+    return String(value || "").trim().replace(/#.*$/, "").replace(/\/$/, "");
+  }
+}
+
 function slugify(input: string, fallback: string = "item"): string {
   const slug = input
     .toLowerCase()
@@ -851,7 +868,23 @@ function slugify(input: string, fallback: string = "item"): string {
 }
 
 function documentIdFor(document: CrawledDocument): string {
-  return `${slugify(document.title || document.sourceName || "document")}-${hashId(document.url || document.content)}`;
+  const stableKey = normalizeDocumentUrl(document.url) || document.content || document.title || "document";
+  return `web-${hashId(stableKey, 24)}`;
+}
+
+function contentHashForValues(url: string, title: string, content: string): string {
+  return hashId(
+    [
+      normalizeDocumentUrl(url),
+      String(title || "").trim(),
+      String(content || "").replace(/\r\n?/g, "\n").trim(),
+    ].join("\n"),
+    64
+  );
+}
+
+function contentHashForDocument(document: CrawledDocument): string {
+  return contentHashForValues(document.url, document.title, document.content);
 }
 
 function safeJson(value: any): string {
@@ -917,6 +950,8 @@ async function ensureBigQueryKnowledgeStore(): Promise<boolean> {
           category STRING,
           crawler STRING,
           gcs_uri STRING,
+          content_hash STRING,
+          crawl_batch_id STRING,
           content STRING,
           metadata_json STRING,
           created_at TIMESTAMP,
@@ -932,6 +967,8 @@ async function ensureBigQueryKnowledgeStore(): Promise<boolean> {
           chunk_index INT64,
           content STRING,
           embedding ARRAY<FLOAT64>,
+          content_hash STRING,
+          crawl_batch_id STRING,
           metadata_json STRING,
           created_at TIMESTAMP
         )
@@ -950,6 +987,8 @@ async function ensureBigQueryKnowledgeStore(): Promise<boolean> {
           target_type STRING,
           target_description STRING,
           relation STRING,
+          content_hash STRING,
+          crawl_batch_id STRING,
           metadata_json STRING,
           created_at TIMESTAMP
         )
@@ -979,6 +1018,17 @@ async function ensureBigQueryKnowledgeStore(): Promise<boolean> {
       `);
 
       try {
+        await runBigQuery(`ALTER TABLE ${bqTableRef(BQ_CORPUS_TABLE)} ADD COLUMN IF NOT EXISTS content_hash STRING`);
+        await runBigQuery(`ALTER TABLE ${bqTableRef(BQ_CORPUS_TABLE)} ADD COLUMN IF NOT EXISTS crawl_batch_id STRING`);
+        await runBigQuery(`ALTER TABLE ${bqTableRef(BQ_CHUNKS_TABLE)} ADD COLUMN IF NOT EXISTS content_hash STRING`);
+        await runBigQuery(`ALTER TABLE ${bqTableRef(BQ_CHUNKS_TABLE)} ADD COLUMN IF NOT EXISTS crawl_batch_id STRING`);
+        await runBigQuery(`ALTER TABLE ${bqTableRef(BQ_GRAPH_TABLE)} ADD COLUMN IF NOT EXISTS content_hash STRING`);
+        await runBigQuery(`ALTER TABLE ${bqTableRef(BQ_GRAPH_TABLE)} ADD COLUMN IF NOT EXISTS crawl_batch_id STRING`);
+      } catch (err: any) {
+        console.warn("BigQuery schema migration: continuing with existing table shape:", err.message);
+      }
+
+      try {
         await runBigQuery(`
           CREATE VECTOR INDEX IF NOT EXISTS chunks_embedding_idx
           ON ${bqTableRef(BQ_CHUNKS_TABLE)}(embedding)
@@ -997,7 +1047,7 @@ async function ensureBigQueryKnowledgeStore(): Promise<boolean> {
   return bigQueryInitPromise;
 }
 
-async function uploadRawMarkdownToGCS(document: CrawledDocument, documentId: string): Promise<{ status: GcpPipelineStatus; uri?: string }> {
+async function uploadRawMarkdownToGCS(document: CrawledDocument, documentId: string, contentHash: string, crawlBatchId: string): Promise<{ status: GcpPipelineStatus; uri?: string }> {
   const client = getStorageClient();
   if (!client) return { status: "SKIPPED_NOT_CONFIGURED" };
 
@@ -1013,6 +1063,8 @@ async function uploadRawMarkdownToGCS(document: CrawledDocument, documentId: str
           sourceUrl: document.url,
           sourceName: document.sourceName || "",
           crawler: document.crawler,
+          contentHash,
+          crawlBatchId,
         },
       },
     });
@@ -1023,7 +1075,7 @@ async function uploadRawMarkdownToGCS(document: CrawledDocument, documentId: str
   }
 }
 
-function buildGraphRows(document: CrawledDocument, documentId: string, graphData: GraphExtraction): any[] {
+function buildGraphRows(document: CrawledDocument, documentId: string, graphData: GraphExtraction, contentHash: string, crawlBatchId: string): any[] {
   const nodesById = new Map<string, KnowledgeNode>();
   for (const node of graphData.nodes || []) {
     nodesById.set(String(node.id).toLowerCase(), node);
@@ -1046,17 +1098,202 @@ function buildGraphRows(document: CrawledDocument, documentId: string, graphData
       target_type: targetNode?.type || "Entity",
       target_description: targetNode?.description || "",
       relation: link.relation,
+      content_hash: contentHash,
+      crawl_batch_id: crawlBatchId,
       metadata_json: safeJson({
         title: document.title,
         sourceName: document.sourceName,
         category: document.category,
+        contentHash,
+        crawlBatchId,
       }),
       created_at: new Date().toISOString(),
     };
   });
 }
 
-async function writeRowsToBigQuery(document: CrawledDocument, documentId: string, chunks: PreparedChunk[], graphData: GraphExtraction, gcsUri?: string): Promise<GcpPipelineStatus> {
+type ExistingDocumentRecord = {
+  documentId: string;
+  contentHash?: string;
+  updatedAt?: string;
+};
+
+async function getExistingDocumentRecord(documentId: string): Promise<ExistingDocumentRecord | null> {
+  if (!isGcpNativeConfigured()) return null;
+
+  try {
+    await ensureBigQueryKnowledgeStore();
+    const rows = await runBigQuery(`
+      SELECT
+        document_id,
+        source_url,
+        title,
+        content,
+        content_hash,
+        updated_at
+      FROM ${bqTableRef(BQ_CORPUS_TABLE)}
+      WHERE document_id = @documentId
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `, { documentId });
+
+    const row = rows[0];
+    if (!row) return null;
+
+    return {
+      documentId: row.document_id,
+      contentHash: row.content_hash || contentHashForValues(row.source_url || "", row.title || "", row.content || ""),
+      updatedAt: row.updated_at?.value || row.updated_at,
+    };
+  } catch (err: any) {
+    console.error("BigQuery existing document lookup failed:", err.message);
+    return null;
+  }
+}
+
+async function mergeChunkRowToBigQuery(chunk: PreparedChunk, document: CrawledDocument, contentHash: string, crawlBatchId: string, now: string): Promise<void> {
+  const hasEmbedding = chunk.embedding.length > 0;
+  const embeddingExpr = hasEmbedding ? "@embedding" : "ARRAY<FLOAT64>[]";
+  const params: Record<string, any> = {
+    chunkId: chunk.chunkId,
+    documentId: chunk.documentId,
+    sourceUrl: document.url,
+    title: document.title,
+    chunkIndex: chunk.chunkIndex,
+    content: chunk.content,
+    metadataJson: safeJson({
+      ...chunk.metadata,
+      contentHash,
+      crawlBatchId,
+    }),
+    contentHash,
+    crawlBatchId,
+    now,
+  };
+  if (hasEmbedding) {
+    params.embedding = chunk.embedding;
+  }
+
+  await runBigQuery(`
+    MERGE ${bqTableRef(BQ_CHUNKS_TABLE)} AS target
+    USING (SELECT @chunkId AS chunk_id) AS source
+    ON target.chunk_id = source.chunk_id
+    WHEN MATCHED THEN UPDATE SET
+      document_id = @documentId,
+      source_url = @sourceUrl,
+      title = @title,
+      chunk_index = @chunkIndex,
+      content = @content,
+      embedding = ${embeddingExpr},
+      content_hash = @contentHash,
+      crawl_batch_id = @crawlBatchId,
+      metadata_json = @metadataJson,
+      created_at = TIMESTAMP(@now)
+    WHEN NOT MATCHED THEN INSERT (
+      chunk_id,
+      document_id,
+      source_url,
+      title,
+      chunk_index,
+      content,
+      embedding,
+      content_hash,
+      crawl_batch_id,
+      metadata_json,
+      created_at
+    ) VALUES (
+      @chunkId,
+      @documentId,
+      @sourceUrl,
+      @title,
+      @chunkIndex,
+      @content,
+      ${embeddingExpr},
+      @contentHash,
+      @crawlBatchId,
+      @metadataJson,
+      TIMESTAMP(@now)
+    )
+  `, params);
+}
+
+async function mergeGraphRowToBigQuery(row: any, now: string): Promise<void> {
+  await runBigQuery(`
+    MERGE ${bqTableRef(BQ_GRAPH_TABLE)} AS target
+    USING (SELECT @edgeId AS edge_id) AS source
+    ON target.edge_id = source.edge_id
+    WHEN MATCHED THEN UPDATE SET
+      document_id = @documentId,
+      source_url = @sourceUrl,
+      source_id = @sourceId,
+      source_label = @sourceLabel,
+      source_type = @sourceType,
+      source_description = @sourceDescription,
+      target_id = @targetId,
+      target_label = @targetLabel,
+      target_type = @targetType,
+      target_description = @targetDescription,
+      relation = @relation,
+      content_hash = @contentHash,
+      crawl_batch_id = @crawlBatchId,
+      metadata_json = @metadataJson,
+      created_at = TIMESTAMP(@now)
+    WHEN NOT MATCHED THEN INSERT (
+      edge_id,
+      document_id,
+      source_url,
+      source_id,
+      source_label,
+      source_type,
+      source_description,
+      target_id,
+      target_label,
+      target_type,
+      target_description,
+      relation,
+      content_hash,
+      crawl_batch_id,
+      metadata_json,
+      created_at
+    ) VALUES (
+      @edgeId,
+      @documentId,
+      @sourceUrl,
+      @sourceId,
+      @sourceLabel,
+      @sourceType,
+      @sourceDescription,
+      @targetId,
+      @targetLabel,
+      @targetType,
+      @targetDescription,
+      @relation,
+      @contentHash,
+      @crawlBatchId,
+      @metadataJson,
+      TIMESTAMP(@now)
+    )
+  `, {
+    edgeId: row.edge_id,
+    documentId: row.document_id,
+    sourceUrl: row.source_url,
+    sourceId: row.source_id,
+    sourceLabel: row.source_label,
+    sourceType: row.source_type,
+    sourceDescription: row.source_description,
+    targetId: row.target_id,
+    targetLabel: row.target_label,
+    targetType: row.target_type,
+    targetDescription: row.target_description,
+    relation: row.relation,
+    contentHash: row.content_hash,
+    crawlBatchId: row.crawl_batch_id,
+    metadataJson: row.metadata_json,
+    now,
+  });
+}
+
+async function writeRowsToBigQuery(document: CrawledDocument, documentId: string, contentHash: string, crawlBatchId: string, chunks: PreparedChunk[], graphData: GraphExtraction, gcsUri?: string): Promise<GcpPipelineStatus> {
   if (!isGcpNativeConfigured()) return "SKIPPED_NOT_CONFIGURED";
 
   try {
@@ -1065,44 +1302,92 @@ async function writeRowsToBigQuery(document: CrawledDocument, documentId: string
     if (!client) return "SKIPPED_NOT_CONFIGURED";
 
     const now = new Date().toISOString();
-    // BigQuery streaming inserts cannot be immediately updated/deleted. Keep ingestion
-    // append-only here; query paths de-duplicate by IDs where strict uniqueness matters.
-    await client.dataset(BQ_DATASET).table(BQ_CORPUS_TABLE).insert([{
-      document_id: documentId,
-      source_url: document.url,
+
+    await runBigQuery(`
+      MERGE ${bqTableRef(BQ_CORPUS_TABLE)} AS target
+      USING (SELECT @documentId AS document_id) AS source
+      ON target.document_id = source.document_id
+      WHEN MATCHED THEN UPDATE SET
+        source_url = @sourceUrl,
+        title = @title,
+        source_name = @sourceName,
+        category = @category,
+        crawler = @crawler,
+        gcs_uri = @gcsUri,
+        content_hash = @contentHash,
+        crawl_batch_id = @crawlBatchId,
+        content = @content,
+        metadata_json = @metadataJson,
+        updated_at = TIMESTAMP(@now)
+      WHEN NOT MATCHED THEN INSERT (
+        document_id,
+        source_url,
+        title,
+        source_name,
+        category,
+        crawler,
+        gcs_uri,
+        content_hash,
+        crawl_batch_id,
+        content,
+        metadata_json,
+        created_at,
+        updated_at
+      ) VALUES (
+        @documentId,
+        @sourceUrl,
+        @title,
+        @sourceName,
+        @category,
+        @crawler,
+        @gcsUri,
+        @contentHash,
+        @crawlBatchId,
+        @content,
+        @metadataJson,
+        TIMESTAMP(@now),
+        TIMESTAMP(@now)
+      )
+    `, {
+      documentId,
+      sourceUrl: document.url,
       title: document.title,
-      source_name: document.sourceName || "",
+      sourceName: document.sourceName || "",
       category: document.category || "",
       crawler: document.crawler,
-      gcs_uri: gcsUri || "",
+      gcsUri: gcsUri || "",
+      contentHash,
+      crawlBatchId,
       content: document.content,
-      metadata_json: safeJson({
+      metadataJson: safeJson({
         depth: document.depth,
         embeddingModel: BQ_EMBEDDING_MODEL,
+        contentHash,
+        crawlBatchId,
       }),
-      created_at: now,
-      updated_at: now,
-    }], { ignoreUnknownValues: true } as any);
+      now,
+    });
 
-    const chunkRows = chunks.map(chunk => ({
-      chunk_id: chunk.chunkId,
-      document_id: documentId,
-      source_url: document.url,
-      title: document.title,
-      chunk_index: chunk.chunkIndex,
-      content: chunk.content,
-      embedding: chunk.embedding,
-      metadata_json: safeJson(chunk.metadata),
-      created_at: now,
-    }));
-    if (chunkRows.length > 0) {
-      await client.dataset(BQ_DATASET).table(BQ_CHUNKS_TABLE).insert(chunkRows, { ignoreUnknownValues: true } as any);
+    for (const chunk of chunks) {
+      await mergeChunkRowToBigQuery(chunk, document, contentHash, crawlBatchId, now);
     }
 
-    const graphRows = buildGraphRows(document, documentId, graphData);
-    if (graphRows.length > 0) {
-      await client.dataset(BQ_DATASET).table(BQ_GRAPH_TABLE).insert(graphRows, { ignoreUnknownValues: true } as any);
+    const graphRows = buildGraphRows(document, documentId, graphData, contentHash, crawlBatchId);
+    for (const row of graphRows) {
+      await mergeGraphRowToBigQuery(row, now);
     }
+
+    await runBigQuery(`
+      DELETE FROM ${bqTableRef(BQ_CHUNKS_TABLE)}
+      WHERE document_id = @documentId
+        AND (content_hash IS NULL OR content_hash != @contentHash)
+    `, { documentId, contentHash });
+
+    await runBigQuery(`
+      DELETE FROM ${bqTableRef(BQ_GRAPH_TABLE)}
+      WHERE document_id = @documentId
+        AND (content_hash IS NULL OR content_hash != @contentHash)
+    `, { documentId, contentHash });
 
     return "SUCCESS";
   } catch (err: any) {
@@ -1275,7 +1560,7 @@ function yamlString(value: string): string {
   return `"${String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-async function exportMetadataAsCode(document: CrawledDocument, documentId: string, graphData: GraphExtraction, gcsUri?: string): Promise<{ status: GcpPipelineStatus; path?: string }> {
+async function exportMetadataAsCode(document: CrawledDocument, documentId: string, graphData: GraphExtraction, contentHash: string, crawlBatchId: string, gcsUri?: string): Promise<{ status: GcpPipelineStatus; path?: string }> {
   try {
     const entriesDir = path.join(MDCODE_EXPORT_DIR, "entries");
     await fs.promises.mkdir(entriesDir, { recursive: true });
@@ -1290,6 +1575,8 @@ async function exportMetadataAsCode(document: CrawledDocument, documentId: strin
       `source_name: ${yamlString(document.sourceName || "")}`,
       `category: ${yamlString(document.category || "")}`,
       `gcs_uri: ${yamlString(gcsUri || "")}`,
+      `content_hash: ${yamlString(contentHash)}`,
+      `crawl_batch_id: ${yamlString(crawlBatchId)}`,
       `nodes_count: ${graphData.nodes?.length || 0}`,
       `links_count: ${graphData.links?.length || 0}`,
       "---",
@@ -1513,17 +1800,16 @@ async function publishToKnowledgeCatalog(document: CrawledDocument, documentId: 
   }
 }
 
-async function persistGcpNativeKnowledge(document: CrawledDocument, chunks: PreparedChunk[], graphData: GraphExtraction): Promise<{
+async function persistGcpNativeKnowledge(document: CrawledDocument, documentId: string, contentHash: string, crawlBatchId: string, chunks: PreparedChunk[], graphData: GraphExtraction): Promise<{
   gcsStatus: GcpPipelineStatus;
   bigQueryStatus: GcpPipelineStatus;
   knowledgeCatalogStatus: GcpPipelineStatus;
   metadataCatalogPath?: string;
   gcsRawUri?: string;
 }> {
-  const documentId = chunks[0]?.documentId || documentIdFor(document);
-  const gcsResult = await uploadRawMarkdownToGCS(document, documentId);
-  const metadataResult = await exportMetadataAsCode(document, documentId, graphData, gcsResult.uri);
-  const bigQueryStatus = await writeRowsToBigQuery(document, documentId, chunks, graphData, gcsResult.uri);
+  const gcsResult = await uploadRawMarkdownToGCS(document, documentId, contentHash, crawlBatchId);
+  const metadataResult = await exportMetadataAsCode(document, documentId, graphData, contentHash, crawlBatchId, gcsResult.uri);
+  const bigQueryStatus = await writeRowsToBigQuery(document, documentId, contentHash, crawlBatchId, chunks, graphData, gcsResult.uri);
   const knowledgeCatalogStatus = await publishToKnowledgeCatalog(document, documentId, graphData, gcsResult.uri);
 
   return {
@@ -1835,12 +2121,12 @@ async function resetBigQueryGraph(): Promise<{ nodes: KnowledgeNode[]; links: Kn
       sourceName: "Mursyid AI",
       category: "website",
     };
-    const baselineGraph: GraphExtraction = {
-      nodes: INITIAL_NODES as KnowledgeNode[],
-      links: INITIAL_LINKS as KnowledgeLink[],
-    };
-    await writeRowsToBigQuery(baselineDocument, "baseline", [], baselineGraph, undefined);
-    return { nodes: INITIAL_NODES as KnowledgeNode[], links: INITIAL_LINKS as KnowledgeLink[] };
+	    const baselineGraph: GraphExtraction = {
+	      nodes: INITIAL_NODES as KnowledgeNode[],
+	      links: INITIAL_LINKS as KnowledgeLink[],
+	    };
+	    await writeRowsToBigQuery(baselineDocument, "baseline", contentHashForDocument(baselineDocument), "baseline-reset", [], baselineGraph, undefined);
+	    return { nodes: INITIAL_NODES as KnowledgeNode[], links: INITIAL_LINKS as KnowledgeLink[] };
   } catch (err: any) {
     console.error("BigQuery graph reset failed:", err.message);
     return null;
@@ -2148,11 +2434,31 @@ function mergeGraphIntoMemory(graphData: GraphExtraction) {
 // ==========================================
 // END-TO-END INGESTION CONTROL PIPELINE
 // ==========================================
-async function ingestDocumentContent(document: CrawledDocument, ai: GoogleGenAI): Promise<IngestStats> {
+async function ingestDocumentContent(document: CrawledDocument, ai: GoogleGenAI, crawlBatchId: string): Promise<IngestStats> {
   const { url, title, content } = document;
   
   if (!content || content.trim().length === 0) {
     throw new Error("Laman web tidak mengandungi sebarang kandungan teks rencana yang bermaklumat.");
+  }
+
+  const documentId = documentIdFor(document);
+  const contentHash = contentHashForDocument(document);
+  const existingDocument = await getExistingDocumentRecord(documentId);
+  if (existingDocument?.contentHash === contentHash) {
+    return {
+      chunksCount: 0,
+      nodesCount: 0,
+      linksCount: 0,
+      title,
+      documentsCount: 1,
+      skippedDocumentsCount: 1,
+      updatedDocumentsCount: 0,
+      crawler: document.crawler,
+      gcsStatus: isGcpNativeConfigured() && GCS_RAW_BUCKET ? "SUCCESS" : "SKIPPED_NOT_CONFIGURED",
+      bigQueryStatus: isGcpNativeConfigured() ? "SUCCESS" : "SKIPPED_NOT_CONFIGURED",
+      knowledgeCatalogStatus: isGcpNativeConfigured() ? "SUCCESS" : "SKIPPED_NOT_CONFIGURED",
+      gcsRawUris: []
+    };
   }
   
   let chunksCount = 0;
@@ -2162,7 +2468,6 @@ async function ingestDocumentContent(document: CrawledDocument, ai: GoogleGenAI)
   // 1. Prepare semantic chunks for BigQuery Vector Search.
   const chunks = chunkText(content, 1200, 200);
   chunksCount = chunks.length;
-  const documentId = documentIdFor(document);
   const preparedChunks: PreparedChunk[] = [];
 
   for (const [index, chunk] of chunks.entries()) {
@@ -2259,7 +2564,7 @@ async function ingestDocumentContent(document: CrawledDocument, ai: GoogleGenAI)
   nodesCount = graphData.nodes?.length || 0;
   linksCount = graphData.links?.length || 0;
 
-  const gcpStatus = await persistGcpNativeKnowledge(document, preparedChunks, graphData);
+  const gcpStatus = await persistGcpNativeKnowledge(document, documentId, contentHash, crawlBatchId, preparedChunks, graphData);
   mergeGraphIntoMemory(graphData);
 
   return {
@@ -2268,6 +2573,8 @@ async function ingestDocumentContent(document: CrawledDocument, ai: GoogleGenAI)
     linksCount,
     title,
 	    documentsCount: 1,
+	    skippedDocumentsCount: 0,
+	    updatedDocumentsCount: 1,
 	    crawler: document.crawler,
 	    gcsStatus: gcpStatus.gcsStatus,
 	    bigQueryStatus: gcpStatus.bigQueryStatus,
@@ -2277,7 +2584,7 @@ async function ingestDocumentContent(document: CrawledDocument, ai: GoogleGenAI)
 	  };
 }
 
-async function ingestURLContent(url: string, ai: GoogleGenAI, source?: CrawlSource, maxPagesOverride?: number): Promise<IngestStats> {
+async function ingestURLContent(url: string, ai: GoogleGenAI, source?: CrawlSource, maxPagesOverride?: number, crawlBatchId: string = randomUUID()): Promise<IngestStats> {
   const documents = await crawlDocumentsForIngestion(url, ai, source, maxPagesOverride);
   const aggregate: IngestStats = {
     title: documents[0]?.title || source?.name || "Rujukan Kontemporari",
@@ -2285,6 +2592,8 @@ async function ingestURLContent(url: string, ai: GoogleGenAI, source?: CrawlSour
     nodesCount: 0,
     linksCount: 0,
     documentsCount: documents.length,
+    skippedDocumentsCount: 0,
+    updatedDocumentsCount: 0,
     crawler: documents[0]?.crawler || "unknown",
     gcsStatus: "SKIPPED_NOT_CONFIGURED",
     bigQueryStatus: "SKIPPED_NOT_CONFIGURED",
@@ -2296,10 +2605,12 @@ async function ingestURLContent(url: string, ai: GoogleGenAI, source?: CrawlSour
   const knowledgeCatalogStatuses: GcpPipelineStatus[] = [];
 
   for (const document of documents) {
-    const stats = await ingestDocumentContent(document, ai);
+    const stats = await ingestDocumentContent(document, ai, crawlBatchId);
     aggregate.chunksCount += stats.chunksCount;
     aggregate.nodesCount += stats.nodesCount;
     aggregate.linksCount += stats.linksCount;
+    aggregate.skippedDocumentsCount = (aggregate.skippedDocumentsCount || 0) + (stats.skippedDocumentsCount || 0);
+    aggregate.updatedDocumentsCount = (aggregate.updatedDocumentsCount || 0) + (stats.updatedDocumentsCount || 0);
     aggregate.gcsRawUris.push(...stats.gcsRawUris);
     aggregate.metadataCatalogPath = stats.metadataCatalogPath || aggregate.metadataCatalogPath;
     gcsStatuses.push(stats.gcsStatus);
@@ -2493,8 +2804,12 @@ app.post("/api/chat", async (req, res) => {
     if (isGcpNativeConfigured()) {
       try {
         console.log(`GCP Native Retrieval: BigQuery + Knowledge Catalog context search for: "${message}"`);
-        const vectorChunks = filterRelevantChunks(await searchBigQueryVectorChunks(ai, message, 5), keywords).slice(0, 3);
-        const graphTriples = filterRelevantTriples(await searchBigQueryGraphTriples(keywords), keywords);
+        const [rawVectorChunks, rawGraphTriples] = await Promise.all([
+          searchBigQueryVectorChunks(ai, message, 5),
+          searchBigQueryGraphTriples(keywords),
+        ]);
+        const vectorChunks = filterRelevantChunks(rawVectorChunks, keywords).slice(0, 3);
+        const graphTriples = filterRelevantTriples(rawGraphTriples, keywords);
 
         if (vectorChunks.length > 0 || graphTriples.length > 0) {
           groundedContext += "\n\nMAKLUMAT SAHIH DARIPADA BIGQUERY VECTOR SEARCH & KNOWLEDGE CATALOG MURSYID AI:\n";
@@ -2557,6 +2872,44 @@ app.post("/api/chat", async (req, res) => {
     }));
 
     const contents = [...formattedHistory, { role: "user", parts: [{ text: message }] }];
+
+    const wantsStream =
+      String(req.query.stream || "").toLowerCase() === "true" ||
+      String(req.headers.accept || "").includes("application/x-ndjson");
+
+    if (wantsStream) {
+      res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders?.();
+
+      const writeEvent = (event: Record<string, unknown>) => {
+        res.write(`${JSON.stringify(event)}\n`);
+      };
+
+      writeEvent({ type: "metadata", citations, relevantGraph });
+
+      let streamedText = "";
+      const stream = await ai.models.generateContentStream({
+        model: CHAT_MODEL,
+        contents,
+        config: {
+          systemInstruction: finalSystemInstruction,
+          temperature: 0.15, // Extremely low temperature to enforce strict adherence to groundings
+        }
+      });
+
+      for await (const chunk of stream) {
+        const chunkText = chunk.text || "";
+        if (!chunkText) continue;
+        streamedText += chunkText;
+        writeEvent({ type: "text", text: chunkText });
+      }
+
+      writeEvent({ type: "done", text: streamedText || "Maaf, tiada jawapan dijana." });
+      res.end();
+      return;
+    }
 
     const response = await ai.models.generateContent({
       model: CHAT_MODEL,
@@ -2723,7 +3076,7 @@ app.post("/api/ingest-batch", async (req, res) => {
 
       try {
         console.log(`Crawler: Ingesting source: ${source.name} (${source.url})`);
-        const stats = await ingestURLContent(source.url, ai, source);
+        const stats = await ingestURLContent(source.url, ai, source, undefined, batchRunId);
         
         logEntry.title = stats.title;
         logEntry.status = "SUCCESS";
@@ -2735,7 +3088,7 @@ app.post("/api/ingest-batch", async (req, res) => {
 	        logEntry.gcsStatus = stats.gcsStatus;
 	        logEntry.bigQueryStatus = stats.bigQueryStatus;
 	        logEntry.knowledgeCatalogStatus = stats.knowledgeCatalogStatus;
-	        logEntry.log = `Mengindeks ${stats.documentsCount} dokumen/${stats.chunksCount} chunks ke BigQuery Vector Search, mengekstrak ${stats.nodesCount} nod + ${stats.linksCount} hubungan, GCS: ${stats.gcsStatus}, Knowledge Catalog: ${stats.knowledgeCatalogStatus}.`;
+	        logEntry.log = `Mengindeks ${stats.updatedDocumentsCount || 0}/${stats.documentsCount} dokumen baharu/berubah, melangkau ${stats.skippedDocumentsCount || 0} dokumen tidak berubah, ${stats.chunksCount} chunks, ${stats.nodesCount} nod + ${stats.linksCount} hubungan, GCS: ${stats.gcsStatus}, Knowledge Catalog: ${stats.knowledgeCatalogStatus}.`;
       } catch (err: any) {
         console.error(`Crawler Error for ${source.url}:`, err.message);
         logEntry.status = "FAILED";

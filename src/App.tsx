@@ -69,6 +69,7 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => [createWelcomeMessage()]);
   const [userInput, setUserInput] = useState("");
   const [isChatLoading, setIsChatLoading] = useState(false);
+  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
   const [chatError, setChatError] = useState<string | null>(null);
   const [feedbackRecords, setFeedbackRecords] = useState<FeedbackRecord[]>([]);
   const [feedbackAnalytics, setFeedbackAnalytics] = useState<FeedbackAnalytics>({
@@ -334,8 +335,16 @@ export default function App() {
       content: textToSend,
       timestamp: new Date()
     };
+    const botMessageId = `bot-${Date.now()}`;
+    const pendingBotMsg: ChatMessage = {
+      id: botMessageId,
+      role: "model",
+      content: "Menyediakan konteks rujukan...",
+      timestamp: new Date()
+    };
 
-    setChatMessages((prev) => [...prev, userMsg]);
+    setStreamingMessageId(botMessageId);
+    setChatMessages((prev) => [...prev, userMsg, pendingBotMsg]);
 
     try {
       // Package conversation history to keep context
@@ -346,31 +355,79 @@ export default function App() {
 
       const headers: Record<string, string> = { "Content-Type": "application/json" };
 
-      const response = await fetch("/api/chat", {
+      const response = await fetch("/api/chat?stream=true", {
         method: "POST",
-        headers,
+        headers: {
+          ...headers,
+          Accept: "application/x-ndjson",
+        },
         body: JSON.stringify({ message: textToSend, history: serverHistory })
       });
 
-      const data = await response.json();
-
       if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
         if (data.needsAdc) {
           throw new Error("Konfigurasi ADC / Vertex AI belum lengkap untuk akaun perkhidmatan Cloud Run.");
         }
         throw new Error(data.error || "Gagal menghubungi ejen Syariah.");
       }
 
-      const botMsg: ChatMessage = {
-        id: `bot-${Date.now()}`,
-        role: "model",
-        content: data.text,
-        timestamp: new Date(),
-        citations: data.citations,
-        relevantGraph: data.relevantGraph
+      if (!response.body) {
+        throw new Error("Pelayar tidak menyokong penstriman respons.");
+      }
+
+      let streamedText = "";
+      let citations: ChatMessage["citations"] = [];
+      let relevantGraph: ChatMessage["relevantGraph"];
+
+      const updateBotMessage = (patch: Partial<ChatMessage>) => {
+        setChatMessages((prev) =>
+          prev.map((message) =>
+            message.id === botMessageId ? { ...message, ...patch } : message
+          )
+        );
       };
 
-      setChatMessages((prev) => [...prev, botMsg]);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      const handleStreamEvent = (event: any) => {
+        if (event.type === "metadata") {
+          citations = Array.isArray(event.citations) ? event.citations : [];
+          relevantGraph = event.relevantGraph;
+        } else if (event.type === "text") {
+          streamedText += event.text || "";
+          updateBotMessage({ content: streamedText, citations, relevantGraph });
+        } else if (event.type === "done") {
+          streamedText = streamedText || event.text || "Maaf, tiada jawapan dijana.";
+          updateBotMessage({ content: streamedText, citations, relevantGraph });
+        }
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+
+          const event = JSON.parse(line);
+          handleStreamEvent(event);
+        }
+      }
+
+      if (buffer.trim()) {
+        handleStreamEvent(JSON.parse(buffer));
+      }
+
+      if (!streamedText) {
+        updateBotMessage({ content: "Maaf, tiada jawapan dijana.", citations, relevantGraph });
+      }
     } catch (err: any) {
       console.error(err);
       setChatError(err.message || "Something went wrong.");
@@ -381,9 +438,13 @@ export default function App() {
         content: `Error: ${err.message || "Gagal mendapatkan maklum balas daripada pelayan."}`,
         timestamp: new Date()
       };
-      setChatMessages((prev) => [...prev, errMsg]);
+      setChatMessages((prev) => [
+        ...prev.filter((message) => message.id !== botMessageId),
+        errMsg,
+      ]);
     } finally {
       setIsChatLoading(false);
+      setStreamingMessageId(null);
     }
   };
 
@@ -630,7 +691,7 @@ export default function App() {
                     {isAgentInfoOpen && (
                       <div className="mt-3 space-y-3 border-t border-[#E5E1D8] pt-3">
                         <p className="text-[12px] text-[#5A564E] leading-relaxed">
-                          Kecerdasan Buatan menggunakan model <strong>Gemini 3.5-Flash</strong> bersepadu dengan
+                          Kecerdasan Buatan menggunakan model <strong>Gemini 3.1-Flash-Lite</strong> bersepadu dengan
                           <strong> Google Search Grounding</strong>. Jawapan dipautkan kepada 10 domain rujukan rasmi.
                         </p>
                         <div className="flex flex-wrap gap-1.5">
@@ -751,7 +812,7 @@ export default function App() {
                               </div>
                             )}
 
-                            {msg.role === "model" && msg.id !== "welcome" && (
+                            {msg.role === "model" && msg.id !== "welcome" && msg.id !== streamingMessageId && (
                               <div className="mt-3 flex items-center justify-between gap-3 border-t border-[#E5E1D8] pt-2.5">
                                 <span className="text-[10px] font-semibold uppercase tracking-wide text-[#8A8478]">
                                   Maklum balas jawapan
@@ -804,7 +865,7 @@ export default function App() {
                     </AnimatePresence>
 
                     {/* Chat loading state representation */}
-                    {isChatLoading && (
+                    {isChatLoading && !streamingMessageId && (
                       <div className="flex justify-start">
                         <div className="bg-[#F9F7F2] border border-[#E5E1D8] rounded-2xl rounded-bl-none p-4 max-w-[80%] text-left shadow-sm">
                           <span className="text-[10px] text-[#5A634A] font-bold block mb-2">EJEN ALIM SEDANG MENYEMAK HUJAH...</span>

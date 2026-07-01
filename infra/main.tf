@@ -15,6 +15,17 @@ provider "google" {
 
 locals {
   gcs_raw_bucket_name = var.gcs_raw_bucket_name != "" ? var.gcs_raw_bucket_name : "${var.project_id}-mursyid-raw"
+  cloud_run_memorystore_annotations = var.enable_memorystore ? {
+    "run.googleapis.com/vpc-access-connector" = google_vpc_access_connector.memorystore[0].id
+    "run.googleapis.com/vpc-access-egress"    = "private-ranges-only"
+  } : {}
+  cloud_run_memorystore_env = var.enable_memorystore ? {
+    REDIS_HOST           = google_redis_instance.cache[0].host
+    REDIS_PORT           = tostring(google_redis_instance.cache[0].port)
+    SHARED_CACHE_ENABLED = "true"
+    } : {
+    SHARED_CACHE_ENABLED = "false"
+  }
 }
 
 data "google_project" "current" {
@@ -31,6 +42,9 @@ resource "google_project_service" "apis" {
     "bigqueryconnection.googleapis.com",
     "dataplex.googleapis.com",
     "run.googleapis.com",
+    "compute.googleapis.com",
+    "redis.googleapis.com",
+    "vpcaccess.googleapis.com",
     "secretmanager.googleapis.com",
     "artifactregistry.googleapis.com",
     "iamcredentials.googleapis.com",
@@ -56,6 +70,7 @@ resource "google_project_iam_member" "runtime_roles" {
     "roles/bigquery.jobUser",
     "roles/dataplex.catalogEditor",
     "roles/storage.objectAdmin",
+    "roles/vpcaccess.user",
   ])
 
   project = var.project_id
@@ -67,6 +82,7 @@ resource "google_project_iam_member" "cloud_build_roles" {
   for_each = toset([
     "roles/artifactregistry.writer",
     "roles/run.admin",
+    "roles/vpcaccess.user",
   ])
 
   project = var.project_id
@@ -93,6 +109,7 @@ resource "google_project_iam_member" "github_deployer_roles" {
   for_each = toset([
     "roles/artifactregistry.writer",
     "roles/run.admin",
+    "roles/vpcaccess.user",
   ])
 
   project = var.project_id
@@ -166,7 +183,50 @@ resource "google_storage_bucket" "raw_markdown" {
 }
 
 # ==============================================================================
-# 4. Artifact Registry Repository
+# 4. Shared Cache Network + Memorystore
+# ==============================================================================
+resource "google_compute_network" "cache" {
+  count = var.enable_memorystore ? 1 : 0
+
+  name                    = var.cache_vpc_network_name
+  auto_create_subnetworks = false
+  depends_on              = [google_project_service.apis]
+}
+
+resource "google_vpc_access_connector" "memorystore" {
+  count = var.enable_memorystore ? 1 : 0
+
+  name          = var.vpc_connector_name
+  region        = var.region
+  network       = google_compute_network.cache[0].name
+  ip_cidr_range = var.vpc_connector_cidr_range
+
+  depends_on = [
+    google_project_service.apis,
+    google_compute_network.cache
+  ]
+}
+
+resource "google_redis_instance" "cache" {
+  count = var.enable_memorystore ? 1 : 0
+
+  name               = var.memorystore_instance_name
+  display_name       = "Mursyid shared response cache"
+  region             = var.region
+  tier               = var.memorystore_tier
+  memory_size_gb     = var.memorystore_memory_size_gb
+  redis_version      = var.memorystore_redis_version
+  authorized_network = google_compute_network.cache[0].id
+  connect_mode       = "DIRECT_PEERING"
+
+  depends_on = [
+    google_project_service.apis,
+    google_compute_network.cache
+  ]
+}
+
+# ==============================================================================
+# 5. Artifact Registry Repository
 # ==============================================================================
 resource "google_artifact_registry_repository" "repo" {
   location      = var.region
@@ -177,7 +237,7 @@ resource "google_artifact_registry_repository" "repo" {
 }
 
 # ==============================================================================
-# 5. Cloud Run Application Service
+# 6. Cloud Run Application Service
 # ==============================================================================
 resource "google_cloud_run_service" "mursyid_app" {
   count = var.deploy_cloud_run ? 1 : 0
@@ -186,6 +246,10 @@ resource "google_cloud_run_service" "mursyid_app" {
   location = var.region
 
   template {
+    metadata {
+      annotations = local.cloud_run_memorystore_annotations
+    }
+
     spec {
       service_account_name = google_service_account.cloud_run_runtime.email
 
@@ -272,6 +336,46 @@ resource "google_cloud_run_service" "mursyid_app" {
           name  = "MDCODE_EXPORT_DIR"
           value = "/tmp/catalog-export"
         }
+        env {
+          name  = "CACHE_ENABLED"
+          value = tostring(var.cache_enabled)
+        }
+        env {
+          name  = "QUERY_NORMALIZATION_ENABLED"
+          value = tostring(var.query_normalization_enabled)
+        }
+        env {
+          name  = "EMBEDDING_CACHE_TTL_MS"
+          value = tostring(var.embedding_cache_ttl_ms)
+        }
+        env {
+          name  = "EMBEDDING_CACHE_MAX_ENTRIES"
+          value = tostring(var.embedding_cache_max_entries)
+        }
+        env {
+          name  = "RETRIEVAL_CACHE_TTL_MS"
+          value = tostring(var.retrieval_cache_ttl_ms)
+        }
+        env {
+          name  = "RETRIEVAL_CACHE_MAX_ENTRIES"
+          value = tostring(var.retrieval_cache_max_entries)
+        }
+        env {
+          name  = "CHAT_RESPONSE_CACHE_TTL_MS"
+          value = tostring(var.chat_response_cache_ttl_ms)
+        }
+        env {
+          name  = "CHAT_RESPONSE_CACHE_MAX_ENTRIES"
+          value = tostring(var.chat_response_cache_max_entries)
+        }
+
+        dynamic "env" {
+          for_each = local.cloud_run_memorystore_env
+          content {
+            name  = env.key
+            value = env.value
+          }
+        }
       }
     }
   }
@@ -284,7 +388,9 @@ resource "google_cloud_run_service" "mursyid_app" {
   depends_on = [
     google_bigquery_dataset.knowledge,
     google_storage_bucket.raw_markdown,
-    google_project_iam_member.runtime_roles
+    google_project_iam_member.runtime_roles,
+    google_vpc_access_connector.memorystore,
+    google_redis_instance.cache
   ]
 }
 

@@ -9,23 +9,23 @@ import {
   HelpCircle,
   AlertTriangle,
   ExternalLink,
-  Brain,
   CheckCircle2,
   Lock,
   Globe,
+  ThumbsUp,
+  ThumbsDown,
 } from "lucide-react";
 
 import { ChatMessage, KnowledgeNode, KnowledgeLink, SourceWebsite, PresetQuestion } from "./types";
 import { OFFICIAL_SOURCES, PRESET_QUESTIONS, INITIAL_NODES, INITIAL_LINKS } from "./data";
 import { KnowledgeGraph } from "./components/KnowledgeGraph";
 import { SourceCard } from "./components/SourceCard";
-import { ArchitectureExplainer } from "./components/ArchitectureExplainer";
 import { CrawlerPanel } from "./components/CrawlerPanel";
 import { ChatMarkdownRenderer } from "./components/ChatMarkdownRenderer";
 
 export default function App() {
   // Navigation State
-  const [activeTab, setActiveTab] = useState<"chat" | "graph" | "sources" | "engineering">("chat");
+  const [activeTab, setActiveTab] = useState<"chat" | "graph" | "sources">("chat");
   const [graphSubTab, setGraphSubTab] = useState<"visualize" | "ingest">("visualize");
   const [isAgentInfoOpen, setIsAgentInfoOpen] = useState(false);
 
@@ -118,7 +118,10 @@ export default function App() {
         role: "model",
         content: data.text,
         timestamp: new Date(),
-        citations: data.citations
+        citations: data.citations,
+        responseId: data.responseId,
+        prompt: textToSend,
+        feedbackStatus: "idle"
       };
 
       setChatMessages((prev) => [...prev, botMsg]);
@@ -135,6 +138,54 @@ export default function App() {
       setChatMessages((prev) => [...prev, errMsg]);
     } finally {
       setIsChatLoading(false);
+    }
+  };
+
+  const handleResponseFeedback = async (message: ChatMessage, rating: "up" | "down") => {
+    if (message.role !== "model" || message.id === "welcome") return;
+
+    setChatMessages((prev) =>
+      prev.map((msg) =>
+        msg.id === message.id
+          ? { ...msg, feedback: rating, feedbackStatus: "saving" }
+          : msg
+      )
+    );
+
+    try {
+      const response = await fetch("/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messageId: message.id,
+          responseId: message.responseId || message.id,
+          rating,
+          prompt: message.prompt || "",
+          response: message.content,
+          citations: message.citations || []
+        })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || "Gagal menyimpan maklum balas.");
+      }
+
+      setChatMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === message.id
+            ? { ...msg, feedback: rating, feedbackStatus: "saved" }
+            : msg
+        )
+      );
+    } catch (err: any) {
+      console.error(err);
+      setChatMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === message.id
+            ? { ...msg, feedbackStatus: "error" }
+            : msg
+        )
+      );
     }
   };
 
@@ -276,18 +327,6 @@ export default function App() {
           >
             <BookOpen className="w-4 h-4 shrink-0" />
             Saranan & Katalog Dokumen Sahih
-          </button>
-          
-          <button
-            onClick={() => setActiveTab("engineering")}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold tracking-wide transition-all cursor-pointer ${
-              activeTab === "engineering"
-                ? "bg-[#5A634A] text-white shadow-sm"
-                : "text-[#5A564E] hover:text-[#5A634A] hover:bg-[#EAE7DF]/50"
-            }`}
-          >
-            <Brain className="w-4 h-4 shrink-0" />
-            Analisis Senibina Indeksasi (KG vs RAG)
           </button>
         </div>
 
@@ -466,6 +505,48 @@ export default function App() {
                                       {cite.title.length > 25 ? `${cite.title.substring(0, 25)}...` : cite.title}
                                     </a>
                                   ))}
+                                </div>
+                              </div>
+                            )}
+
+                            {msg.role === "model" && msg.id !== "welcome" && (
+                              <div className="mt-3 pt-2.5 border-t border-[#E5E1D8] flex flex-wrap items-center justify-between gap-2">
+                                <span className="text-[10px] font-semibold text-[#8A8478]">
+                                  {msg.feedbackStatus === "saved"
+                                    ? "Maklum balas direkodkan"
+                                    : msg.feedbackStatus === "error"
+                                    ? "Gagal merekod maklum balas"
+                                    : "Nilai jawapan ini"}
+                                </span>
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleResponseFeedback(msg, "up")}
+                                    disabled={msg.feedbackStatus === "saving"}
+                                    aria-label="Tanda jawapan ini membantu"
+                                    title="Membantu"
+                                    className={`p-1.5 rounded-md border transition-colors cursor-pointer disabled:cursor-wait ${
+                                      msg.feedback === "up"
+                                        ? "bg-[#E5F2EE] border-[#0F766E] text-[#0F766E]"
+                                        : "bg-white border-[#E5E1D8] text-[#6D685E] hover:border-[#0F766E] hover:text-[#0F766E]"
+                                    }`}
+                                  >
+                                    <ThumbsUp className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleResponseFeedback(msg, "down")}
+                                    disabled={msg.feedbackStatus === "saving"}
+                                    aria-label="Tanda jawapan ini tidak membantu"
+                                    title="Tidak membantu"
+                                    className={`p-1.5 rounded-md border transition-colors cursor-pointer disabled:cursor-wait ${
+                                      msg.feedback === "down"
+                                        ? "bg-rose-50 border-rose-300 text-rose-700"
+                                        : "bg-white border-[#E5E1D8] text-[#6D685E] hover:border-rose-300 hover:text-rose-700"
+                                    }`}
+                                  >
+                                    <ThumbsDown className="w-3.5 h-3.5" />
+                                  </button>
                                 </div>
                               </div>
                             )}
@@ -723,19 +804,6 @@ export default function App() {
                     />
                   ))}
                 </div>
-              </motion.div>
-            )}
-
-            {/* TAB 4: Indexing Engineering Explainer */}
-            {activeTab === "engineering" && (
-              <motion.div
-                key="engineering-tab"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                transition={{ duration: 0.2 }}
-              >
-                <ArchitectureExplainer />
               </motion.div>
             )}
 

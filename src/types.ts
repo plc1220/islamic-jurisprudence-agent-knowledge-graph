@@ -7,6 +7,10 @@ export interface ChatMessage {
     title: string;
     url: string;
   }[];
+  responseId?: string;
+  prompt?: string;
+  feedback?: "up" | "down";
+  feedbackStatus?: "idle" | "saving" | "saved" | "error";
 }
 
 export interface KnowledgeNode {

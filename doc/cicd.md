@@ -18,6 +18,9 @@ graph LR
     BQ --> BQVS["BigQuery Vector Search"]
     CR --> KC["Knowledge Catalog entries/aspects"]
     CR --> Vertex["Gemini / Vertex AI"]
+    CR --> Redis["Memorystore Redis shared cache"]
+    VPC["Serverless VPC Access"] --> Redis
+    CR --> VPC
 ```
 
 ## GitHub Actions
@@ -44,6 +47,22 @@ Optional variables override workflow defaults:
 | `GCS_RAW_BUCKET` | `my-rd-coe-demo-gen-ai-mursyid-raw` |
 | `GEMINI_LOCATION` | `global` |
 | `BQ_DATASET` | `mursyid_knowledge` |
+| `CACHE_ENABLED` | `true` |
+| `QUERY_NORMALIZATION_ENABLED` | `true` |
+| `EMBEDDING_CACHE_TTL_MS` | `86400000` |
+| `RETRIEVAL_CACHE_TTL_MS` | `900000` |
+| `CHAT_RESPONSE_CACHE_TTL_MS` | `300000` |
+
+Optional Memorystore variables from Terraform outputs:
+
+| Variable | Terraform output | Description |
+| :--- | :--- | :--- |
+| `MEMORYSTORE_REDIS_HOST` | `memorystore_redis_host` | Private Redis IP used for the shared cache. When set, the workflow deploys `SHARED_CACHE_ENABLED=true`. |
+| `MEMORYSTORE_REDIS_PORT` | `memorystore_redis_port` | Redis port, normally `6379`. |
+| `SERVERLESS_VPC_CONNECTOR` | `serverless_vpc_connector` | Full connector ID used by `gcloud run deploy --vpc-connector`. |
+| `REDIS_CONNECT_TIMEOUT_MS` | n/a | Redis connection timeout for fail-open cache calls. Default: `500`. |
+
+If `MEMORYSTORE_REDIS_HOST` is not set, GitHub Actions still deploys successfully with process-local caching only. If `SERVERLESS_VPC_CONNECTOR` is not set, the workflow omits the Cloud Run VPC connector flags.
 
 To create or update the GitHub OIDC deploy identity, apply Terraform and copy the outputs into GitHub repository variables:
 
@@ -52,6 +71,17 @@ cd infra
 terraform apply
 terraform output github_actions_workload_identity_provider
 terraform output github_actions_deploy_service_account
+terraform output memorystore_redis_host
+terraform output memorystore_redis_port
+terraform output serverless_vpc_connector
+```
+
+For a Redis-backed public deployment, set these GitHub repository variables after `terraform apply`:
+
+```bash
+gh variable set MEMORYSTORE_REDIS_HOST --body "$(terraform output -raw memorystore_redis_host)"
+gh variable set MEMORYSTORE_REDIS_PORT --body "$(terraform output -raw memorystore_redis_port)"
+gh variable set SERVERLESS_VPC_CONNECTOR --body "$(terraform output -raw serverless_vpc_connector)"
 ```
 
 ## Cloud Build (Legacy Manual Path)
@@ -72,6 +102,8 @@ terraform output github_actions_deploy_service_account
 
 The Cloud Run deployment uses 2 CPU, 4Gi memory, one max instance, always-allocated CPU, and a 900 second timeout so `/api/ingest-batch` can continue background crawling after the request returns. The single-instance cap keeps the current in-memory crawl status stable until this is moved to a durable queue/job runner.
 
+The legacy Cloud Build path does not automatically read Terraform outputs. If using Cloud Build instead of GitHub Actions, pass the same Redis env vars and VPC connector flags in `cloudbuild.yaml` or through substitutions.
+
 ## Terraform
 
 The Terraform stack enables and provisions:
@@ -79,9 +111,10 @@ The Terraform stack enables and provisions:
 - Cloud Run and Artifact Registry
 - BigQuery dataset for corpus/chunk/graph tables
 - Cloud Storage bucket for raw markdown snapshots
+- Memorystore Redis, dedicated cache VPC, and Serverless VPC Access connector for shared cache
 - Knowledge Catalog / Dataplex API access
 - Vertex AI access for Gemini and embeddings through Application Default Credentials (ADC)
-- A dedicated Cloud Run runtime service account with BigQuery, Storage, Dataplex, and Vertex AI roles
+- A dedicated Cloud Run runtime service account with BigQuery, Storage, Dataplex, Vertex AI, and VPC Access roles
 
 Gemini does not require a `GEMINI_API_KEY` in this deployment. The app uses the Google Gen AI SDK with `vertexai: true`; Cloud Run authenticates through the runtime service account, and local development should use ADC.
 
@@ -118,8 +151,9 @@ gcloud builds submit \
 2. Cloud Storage stores raw markdown snapshots when `GCS_RAW_BUCKET` is configured.
 3. BigQuery receives corpus rows, chunk embeddings, and extracted graph edges.
 4. BigQuery Vector Search retrieves grounded semantic chunks for `/api/chat`.
-5. Knowledge Catalog receives governed source and concept entries with custom aspects.
-6. A metadata-as-code export is written to `MDCODE_EXPORT_DIR` for review/debugging.
+5. Redis/Memorystore serves shared cache hits for repeated embeddings, retrievals, and exact short-lived chat responses when configured.
+6. Knowledge Catalog receives governed source and concept entries with custom aspects.
+7. A metadata-as-code export is written to `MDCODE_EXPORT_DIR` for review/debugging.
 
 ## Local ADC Setup
 

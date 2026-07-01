@@ -27,5 +27,25 @@ knowledge_catalog_entry_group    = "mursyid-knowledge"
 knowledge_catalog_entry_type     = "mursyid-knowledge-entry"
 knowledge_catalog_aspect_type    = "mursyid-context"
 
+# Shared public-facing cache. Memorystore is an always-on paid resource.
+enable_memorystore          = true
+cache_vpc_network_name      = "mursyid-cache-vpc"
+vpc_connector_name          = "mursyid-vpc-connector"
+vpc_connector_cidr_range    = "10.8.0.0/28"
+memorystore_instance_name   = "mursyid-cache"
+memorystore_tier            = "BASIC"
+memorystore_memory_size_gb  = 1
+memorystore_redis_version   = "REDIS_7_0"
+
+# Cache runtime flags passed to Terraform-managed Cloud Run deployments.
+cache_enabled                  = true
+query_normalization_enabled    = true
+embedding_cache_ttl_ms         = 86400000
+embedding_cache_max_entries    = 1000
+retrieval_cache_ttl_ms         = 900000
+retrieval_cache_max_entries    = 500
+chat_response_cache_ttl_ms     = 300000
+chat_response_cache_max_entries = 250
+
 # GitHub Actions OIDC deployment access
 github_repository = "plc1220/islamic-jurisprudence-agent-knowledge-graph"

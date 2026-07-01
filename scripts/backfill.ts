@@ -194,6 +194,9 @@ const BACKFILL_PUBLISH_CATALOG = process.env.BACKFILL_PUBLISH_CATALOG !== "false
 const BACKFILL_RUN_ID = process.env.BACKFILL_RESUME_RUN_ID || randomUUID();
 const LOAD_ROWS_PER_SHARD = Math.max(1, parseInt(process.env.BACKFILL_LOAD_ROWS_PER_SHARD || "5000", 10));
 const LOAD_BYTES_PER_SHARD = Math.max(1024 * 1024, parseInt(process.env.BACKFILL_LOAD_BYTES_PER_SHARD || String(100 * 1024 * 1024), 10));
+const DISCOVERY_FETCH_TIMEOUT_MS = Math.max(5_000, parseInt(process.env.DISCOVERY_FETCH_TIMEOUT_MS || "8000", 10));
+const DISCOVERY_MAX_HTML_FETCHES_PER_SOURCE = Math.max(10, parseInt(process.env.DISCOVERY_MAX_HTML_FETCHES_PER_SOURCE || "500", 10));
+const DISCOVERY_MAX_SITEMAPS_PER_SOURCE = Math.max(5, parseInt(process.env.DISCOVERY_MAX_SITEMAPS_PER_SOURCE || "100", 10));
 
 const bigQuery = new BigQuery({ projectId: GCP_PROJECT_ID });
 const storage = new Storage({ projectId: GCP_PROJECT_ID });
@@ -443,13 +446,16 @@ function sameHost(url: string, seed: string): boolean {
 }
 
 async function fetchText(url: string): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DISCOVERY_FETCH_TIMEOUT_MS);
   const response = await fetch(url, {
+    signal: controller.signal,
     headers: {
       "User-Agent": "Mozilla/5.0 (compatible; MursyidBackfill/1.0)",
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "ms,en;q=0.8",
     },
-  });
+  }).finally(() => clearTimeout(timeout));
   if (!response.ok) {
     throw new Error(`HTTP ${response.status} for ${url}`);
   }
@@ -479,6 +485,10 @@ function extractLinks(html: string, baseUrl: string): string[] {
 
 async function discoverSitemapUrls(sitemapUrl: string, source: CrawlSource, seen = new Set<string>(), depth = 0): Promise<string[]> {
   if (seen.has(sitemapUrl) || depth > 3) return [];
+  if (seen.size >= DISCOVERY_MAX_SITEMAPS_PER_SOURCE) {
+    console.warn(`Discovery warning: sitemap limit reached for ${source.name} (${DISCOVERY_MAX_SITEMAPS_PER_SOURCE}).`);
+    return [];
+  }
   seen.add(sitemapUrl);
 
   try {
@@ -502,6 +512,10 @@ async function discoverHtmlBfs(source: CrawlSource): Promise<string[]> {
   while (queue.length > 0) {
     const current = queue.shift()!;
     if (seen.has(current.url) || current.depth > BACKFILL_DISCOVERY_DEPTH) continue;
+    if (seen.size >= DISCOVERY_MAX_HTML_FETCHES_PER_SOURCE) {
+      console.warn(`Discovery warning: HTML fetch limit reached for ${source.name} (${DISCOVERY_MAX_HTML_FETCHES_PER_SOURCE}).`);
+      break;
+    }
     seen.add(current.url);
 
     let html = "";
@@ -1406,6 +1420,7 @@ async function main(): Promise<void> {
   const candidatesBySource = new Map<number, CandidateUrl[]>();
   const allCandidates: CandidateUrl[] = [];
   for (const source of sources) {
+    console.log(`Discovering URLs for ${source.name} (${source.url}).`);
     const candidates = await discoverSourceUrls(source);
     candidatesBySource.set(source.id, candidates);
     allCandidates.push(...candidates);

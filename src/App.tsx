@@ -379,6 +379,7 @@ export default function App() {
       let streamedText = "";
       let citations: ChatMessage["citations"] = [];
       let relevantGraph: ChatMessage["relevantGraph"];
+      let responseId: string | undefined;
 
       const updateBotMessage = (patch: Partial<ChatMessage>) => {
         setChatMessages((prev) =>
@@ -396,12 +397,15 @@ export default function App() {
         if (event.type === "metadata") {
           citations = Array.isArray(event.citations) ? event.citations : [];
           relevantGraph = event.relevantGraph;
+          responseId = event.responseId || responseId;
+          updateBotMessage({ citations, relevantGraph, responseId, prompt: textToSend });
         } else if (event.type === "text") {
           streamedText += event.text || "";
-          updateBotMessage({ content: streamedText, citations, relevantGraph });
+          updateBotMessage({ content: streamedText, citations, relevantGraph, responseId, prompt: textToSend });
         } else if (event.type === "done") {
           streamedText = streamedText || event.text || "Maaf, tiada jawapan dijana.";
-          updateBotMessage({ content: streamedText, citations, relevantGraph });
+          responseId = event.responseId || responseId;
+          updateBotMessage({ content: streamedText, citations, relevantGraph, responseId, prompt: textToSend });
         }
       };
 
@@ -426,7 +430,7 @@ export default function App() {
       }
 
       if (!streamedText) {
-        updateBotMessage({ content: "Maaf, tiada jawapan dijana.", citations, relevantGraph });
+        updateBotMessage({ content: "Maaf, tiada jawapan dijana.", citations, relevantGraph, responseId, prompt: textToSend });
       }
     } catch (err: any) {
       console.error(err);

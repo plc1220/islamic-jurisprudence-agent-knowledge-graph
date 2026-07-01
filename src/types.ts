@@ -17,6 +17,10 @@ export interface ChatMessage {
     nodes: KnowledgeNode[];
     links: KnowledgeLink[];
   };
+  responseId?: string;
+  prompt?: string;
+  feedback?: "up" | "down";
+  feedbackStatus?: "idle" | "saving" | "saved" | "error";
 }
 
 export interface KnowledgeNode {

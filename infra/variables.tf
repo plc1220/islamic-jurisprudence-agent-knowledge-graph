@@ -75,6 +75,102 @@ variable "gcs_raw_bucket_name" {
   default     = ""
 }
 
+variable "enable_memorystore" {
+  description = "Whether to provision Memorystore for Redis and wire Cloud Run through Serverless VPC Access."
+  type        = bool
+  default     = true
+}
+
+variable "cache_vpc_network_name" {
+  description = "Dedicated VPC network name for Cloud Run to reach Memorystore."
+  type        = string
+  default     = "mursyid-cache-vpc"
+}
+
+variable "vpc_connector_name" {
+  description = "Serverless VPC Access connector name used by Cloud Run for Memorystore traffic."
+  type        = string
+  default     = "mursyid-vpc-connector"
+}
+
+variable "vpc_connector_cidr_range" {
+  description = "Unused /28 CIDR range for the Serverless VPC Access connector."
+  type        = string
+  default     = "10.8.0.0/28"
+}
+
+variable "memorystore_instance_name" {
+  description = "Memorystore for Redis instance name."
+  type        = string
+  default     = "mursyid-cache"
+}
+
+variable "memorystore_tier" {
+  description = "Memorystore tier. BASIC is cheapest; STANDARD_HA adds high availability."
+  type        = string
+  default     = "BASIC"
+}
+
+variable "memorystore_memory_size_gb" {
+  description = "Memorystore Redis memory size in GiB."
+  type        = number
+  default     = 1
+}
+
+variable "memorystore_redis_version" {
+  description = "Memorystore Redis version."
+  type        = string
+  default     = "REDIS_7_0"
+}
+
+variable "cache_enabled" {
+  description = "Enable in-app caching."
+  type        = bool
+  default     = true
+}
+
+variable "query_normalization_enabled" {
+  description = "Enable conservative Malay/fiqh query normalization before cache/retrieval matching."
+  type        = bool
+  default     = true
+}
+
+variable "embedding_cache_ttl_ms" {
+  description = "TTL for embedding cache entries."
+  type        = number
+  default     = 86400000
+}
+
+variable "embedding_cache_max_entries" {
+  description = "Maximum process-local embedding cache entries."
+  type        = number
+  default     = 1000
+}
+
+variable "retrieval_cache_ttl_ms" {
+  description = "TTL for retrieval cache entries."
+  type        = number
+  default     = 900000
+}
+
+variable "retrieval_cache_max_entries" {
+  description = "Maximum process-local retrieval cache entries."
+  type        = number
+  default     = 500
+}
+
+variable "chat_response_cache_ttl_ms" {
+  description = "TTL for exact chat response cache entries."
+  type        = number
+  default     = 300000
+}
+
+variable "chat_response_cache_max_entries" {
+  description = "Maximum process-local exact chat response cache entries."
+  type        = number
+  default     = 250
+}
+
 variable "knowledge_catalog_entry_group" {
   description = "Knowledge Catalog entry group for Mursyid AI custom entries."
   type        = string

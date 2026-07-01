@@ -7,6 +7,7 @@ import fs from "fs";
 import { spawn } from "child_process";
 import { createHash, randomUUID } from "crypto";
 import { createClient } from "redis";
+import net from "net";
 import { BigQuery } from "@google-cloud/bigquery";
 import { Storage } from "@google-cloud/storage";
 import { GoogleAuth } from "google-auth-library";
@@ -44,6 +45,8 @@ const INGESTION_CRAWLER = (process.env.INGESTION_CRAWLER || "crawl4ai").toLowerC
 const CRAWL_MAX_DEPTH = Math.max(0, parseInt(process.env.CRAWL_MAX_DEPTH || "1", 10));
 const CRAWL_MAX_PAGES_PER_SOURCE = Math.max(1, parseInt(process.env.CRAWL_MAX_PAGES_PER_SOURCE || "3", 10));
 const CRAWL4AI_TIMEOUT_MS = Math.max(30_000, parseInt(process.env.CRAWL4AI_TIMEOUT_MS || "180000", 10));
+const CRAWLER_HTTP_TIMEOUT_MS = Math.max(5_000, parseInt(process.env.CRAWLER_HTTP_TIMEOUT_MS || "30000", 10));
+const CRAWLER_USER_AGENT = process.env.CRAWLER_USER_AGENT || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36";
 const GCP_PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || "";
 const GCP_LOCATION = process.env.GCP_LOCATION || "asia-southeast1";
 const GEMINI_LOCATION = process.env.GEMINI_LOCATION || process.env.GOOGLE_CLOUD_LOCATION || "global";
@@ -52,6 +55,7 @@ const BQ_CORPUS_TABLE = process.env.BQ_CORPUS_TABLE || "corpus";
 const BQ_CHUNKS_TABLE = process.env.BQ_CHUNKS_TABLE || "chunks";
 const BQ_GRAPH_TABLE = process.env.BQ_GRAPH_TABLE || "graph_edges";
 const BQ_CRAWL_RUNS_TABLE = process.env.BQ_CRAWL_RUNS_TABLE || "crawl_runs";
+const BQ_FEEDBACK_TABLE = process.env.BQ_FEEDBACK_TABLE || "response_feedback";
 const BQ_EMBEDDING_MODEL = process.env.BQ_EMBEDDING_MODEL || "text-embedding-004";
 const GCS_RAW_BUCKET = process.env.GCS_RAW_BUCKET || "";
 const KNOWLEDGE_CATALOG_ENTRY_GROUP = process.env.KNOWLEDGE_CATALOG_ENTRY_GROUP || "mursyid-knowledge";
@@ -61,6 +65,18 @@ const MDCODE_EXPORT_DIR = process.env.MDCODE_EXPORT_DIR || path.join(process.cwd
 const REDIS_URL = process.env.REDIS_URL || "";
 const SESSION_TTL_SECONDS = Math.max(300, parseInt(process.env.SESSION_TTL_SECONDS || "86400", 10));
 const FEEDBACK_STORE_PATH = process.env.FEEDBACK_STORE_PATH || path.join(process.cwd(), ".data", "review-feedback.jsonl");
+const CACHE_ENABLED = process.env.CACHE_ENABLED !== "false";
+const EMBEDDING_CACHE_TTL_MS = Math.max(60_000, parseInt(process.env.EMBEDDING_CACHE_TTL_MS || "86400000", 10));
+const EMBEDDING_CACHE_MAX_ENTRIES = Math.max(10, parseInt(process.env.EMBEDDING_CACHE_MAX_ENTRIES || "1000", 10));
+const RETRIEVAL_CACHE_TTL_MS = Math.max(60_000, parseInt(process.env.RETRIEVAL_CACHE_TTL_MS || "900000", 10));
+const RETRIEVAL_CACHE_MAX_ENTRIES = Math.max(10, parseInt(process.env.RETRIEVAL_CACHE_MAX_ENTRIES || "500", 10));
+const CHAT_RESPONSE_CACHE_TTL_MS = Math.max(0, parseInt(process.env.CHAT_RESPONSE_CACHE_TTL_MS || "300000", 10));
+const CHAT_RESPONSE_CACHE_MAX_ENTRIES = Math.max(10, parseInt(process.env.CHAT_RESPONSE_CACHE_MAX_ENTRIES || "250", 10));
+const QUERY_NORMALIZATION_ENABLED = process.env.QUERY_NORMALIZATION_ENABLED !== "false";
+const SHARED_CACHE_ENABLED = process.env.SHARED_CACHE_ENABLED === "true";
+const REDIS_HOST = process.env.REDIS_HOST || "";
+const REDIS_PORT = Math.max(1, parseInt(process.env.REDIS_PORT || "6379", 10));
+const REDIS_CONNECT_TIMEOUT_MS = Math.max(100, parseInt(process.env.REDIS_CONNECT_TIMEOUT_MS || "500", 10));
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
@@ -208,6 +224,8 @@ type SessionChatMessage = {
   timestamp: string;
   citations?: { title: string; url: string }[];
   relevantGraph?: GraphExtraction;
+  responseId?: string;
+  prompt?: string;
 };
 type PersistedSessionState = {
   activeTab?: "chat" | "graph" | "sources" | "analytics" | "review" | "engineering";
@@ -238,6 +256,104 @@ type FeedbackRecord = {
   updatedAt: string;
 };
 
+type ChatCacheValue = {
+  text: string;
+  citations: Citation[];
+  relevantGraph: GraphExtraction;
+  responseId: string;
+};
+
+type ResponseFeedbackEvent = {
+  eventId: string;
+  messageId: string;
+  responseId: string;
+  rating: "up" | "down";
+  prompt: string;
+  response: string;
+  citationsJson: string;
+  userAgent: string;
+  createdAt: string;
+};
+
+type CacheStats = {
+  hits: number;
+  misses: number;
+  sets: number;
+  evictions: number;
+  size: number;
+  maxEntries: number;
+  ttlMs: number;
+};
+
+class TtlLruCache<T> {
+  private entries = new Map<string, { value: T; expiresAt: number }>();
+  private hits = 0;
+  private misses = 0;
+  private sets = 0;
+  private evictions = 0;
+
+  constructor(private readonly maxEntries: number, private readonly ttlMs: number) {}
+
+  get(key: string): T | undefined {
+    if (!CACHE_ENABLED || this.ttlMs <= 0) {
+      this.misses += 1;
+      return undefined;
+    }
+
+    const entry = this.entries.get(key);
+    if (!entry) {
+      this.misses += 1;
+      return undefined;
+    }
+
+    if (entry.expiresAt <= Date.now()) {
+      this.entries.delete(key);
+      this.evictions += 1;
+      this.misses += 1;
+      return undefined;
+    }
+
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    this.hits += 1;
+    return entry.value;
+  }
+
+  set(key: string, value: T): void {
+    if (!CACHE_ENABLED || this.ttlMs <= 0) return;
+
+    if (this.entries.has(key)) {
+      this.entries.delete(key);
+    }
+
+    this.entries.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+    this.sets += 1;
+
+    while (this.entries.size > this.maxEntries) {
+      const oldestKey = this.entries.keys().next().value;
+      if (!oldestKey) break;
+      this.entries.delete(oldestKey);
+      this.evictions += 1;
+    }
+  }
+
+  clear(): void {
+    this.entries.clear();
+  }
+
+  stats(): CacheStats {
+    return {
+      hits: this.hits,
+      misses: this.misses,
+      sets: this.sets,
+      evictions: this.evictions,
+      size: this.entries.size,
+      maxEntries: this.maxEntries,
+      ttlMs: this.ttlMs,
+    };
+  }
+}
+
 function emptyRelevantGraph(): GraphExtraction {
   return { nodes: [], links: [] };
 }
@@ -260,6 +376,19 @@ function graphFromRetrievedTriples(triples: RetrievedGraphTriple[]): GraphExtrac
 }
 
 let batchCrawlLogs: CrawlLog[] = [];
+let fallbackFeedbackEvents: ResponseFeedbackEvent[] = [];
+let knowledgeCacheVersion = 1;
+
+const embeddingCache = new TtlLruCache<number[]>(EMBEDDING_CACHE_MAX_ENTRIES, EMBEDDING_CACHE_TTL_MS);
+const vectorRetrievalCache = new TtlLruCache<RetrievedChunk[]>(RETRIEVAL_CACHE_MAX_ENTRIES, RETRIEVAL_CACHE_TTL_MS);
+const graphRetrievalCache = new TtlLruCache<RetrievedGraphTriple[]>(RETRIEVAL_CACHE_MAX_ENTRIES, RETRIEVAL_CACHE_TTL_MS);
+const chatResponseCache = new TtlLruCache<ChatCacheValue>(CHAT_RESPONSE_CACHE_MAX_ENTRIES, CHAT_RESPONSE_CACHE_TTL_MS);
+const sharedCacheStats = {
+  hits: 0,
+  misses: 0,
+  sets: 0,
+  errors: 0,
+};
 
 // ==========================================
 // SESSION STATE STORE: REDIS WITH MEMORY FALLBACK
@@ -788,6 +917,7 @@ function assertBqIdentifiers() {
     BQ_CHUNKS_TABLE,
     BQ_GRAPH_TABLE,
     BQ_CRAWL_RUNS_TABLE,
+    BQ_FEEDBACK_TABLE,
   };
 
   for (const [name, value] of Object.entries(identifiers)) {
@@ -856,6 +986,115 @@ function normalizeDocumentUrl(value?: string): string {
   }
 }
 
+function cacheKey(scope: string, payload: any): string {
+  return `${scope}:${createHash("sha256").update(JSON.stringify(payload)).digest("hex")}`;
+}
+
+function isSharedCacheConfigured(): boolean {
+  return CACHE_ENABLED && SHARED_CACHE_ENABLED && Boolean(REDIS_HOST);
+}
+
+function encodeRedisCommand(parts: string[]): string {
+  return `*${parts.length}\r\n${parts.map(part => `$${Buffer.byteLength(part)}\r\n${part}\r\n`).join("")}`;
+}
+
+function parseRedisResponse(buffer: Buffer): { complete: boolean; value?: string | number | null } {
+  if (buffer.length === 0) return { complete: false };
+
+  const prefix = String.fromCharCode(buffer[0]);
+  const text = buffer.toString("utf8");
+  const lineEnd = text.indexOf("\r\n");
+  if (lineEnd < 0) return { complete: false };
+
+  const line = text.slice(1, lineEnd);
+  if (prefix === "+") return { complete: true, value: line };
+  if (prefix === ":") return { complete: true, value: Number(line) };
+  if (prefix === "-") throw new Error(line || "Redis command failed.");
+  if (prefix !== "$") throw new Error(`Unsupported Redis response prefix: ${prefix}`);
+
+  const length = Number(line);
+  if (length === -1) return { complete: true, value: null };
+  if (!Number.isFinite(length) || length < 0) throw new Error(`Invalid Redis bulk string length: ${line}`);
+
+  const payloadStart = lineEnd + 2;
+  const payloadEnd = payloadStart + length;
+  if (buffer.length < payloadEnd + 2) return { complete: false };
+
+  return {
+    complete: true,
+    value: buffer.subarray(payloadStart, payloadEnd).toString("utf8"),
+  };
+}
+
+async function runRedisCommand(parts: string[]): Promise<string | number | null | undefined> {
+  if (!isSharedCacheConfigured()) return undefined;
+
+  return new Promise(resolve => {
+    const socket = net.createConnection({ host: REDIS_HOST, port: REDIS_PORT });
+    const chunks: Buffer[] = [];
+    let settled = false;
+
+    const finish = (value: string | number | null | undefined, isError = false) => {
+      if (settled) return;
+      settled = true;
+      if (isError) sharedCacheStats.errors += 1;
+      socket.destroy();
+      resolve(value);
+    };
+
+    socket.setTimeout(REDIS_CONNECT_TIMEOUT_MS);
+    socket.on("connect", () => {
+      socket.write(encodeRedisCommand(parts));
+    });
+    socket.on("data", chunk => {
+      chunks.push(Buffer.from(chunk));
+      try {
+        const parsed = parseRedisResponse(Buffer.concat(chunks));
+        if (parsed.complete) finish(parsed.value);
+      } catch (err: any) {
+        console.warn("Shared Redis cache response error:", err.message);
+        finish(undefined, true);
+      }
+    });
+    socket.on("timeout", () => finish(undefined, true));
+    socket.on("error", err => {
+      console.warn("Shared Redis cache connection error:", err.message);
+      finish(undefined, true);
+    });
+  });
+}
+
+function sharedRedisKey(scope: string, key: string): string {
+  return `mursyid:${scope}:${key}`;
+}
+
+async function getSharedJsonCache<T>(scope: string, key: string): Promise<T | undefined> {
+  if (!isSharedCacheConfigured()) return undefined;
+
+  const value = await runRedisCommand(["GET", sharedRedisKey(scope, key)]);
+  if (typeof value !== "string") {
+    sharedCacheStats.misses += 1;
+    return undefined;
+  }
+
+  try {
+    sharedCacheStats.hits += 1;
+    return JSON.parse(value) as T;
+  } catch (err: any) {
+    sharedCacheStats.errors += 1;
+    console.warn("Shared Redis cache JSON parse error:", err.message);
+    return undefined;
+  }
+}
+
+async function setSharedJsonCache(scope: string, key: string, value: any, ttlMs: number): Promise<void> {
+  if (!isSharedCacheConfigured() || ttlMs <= 0) return;
+
+  const ttlSeconds = Math.max(1, Math.ceil(ttlMs / 1000));
+  const result = await runRedisCommand(["SETEX", sharedRedisKey(scope, key), String(ttlSeconds), JSON.stringify(value)]);
+  if (result === "OK") sharedCacheStats.sets += 1;
+}
+
 function slugify(input: string, fallback: string = "item"): string {
   const slug = input
     .toLowerCase()
@@ -865,6 +1104,120 @@ function slugify(input: string, fallback: string = "item"): string {
     .replace(/^-+|-+$/g, "")
     .slice(0, 80);
   return slug || fallback;
+}
+
+function normalizeTextForSearch(input: string): string {
+  return String(input || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/['’`]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function canonicalizeFiqhTerm(word: string): string {
+  const aliases: Record<string, string> = {
+    feqah: "fiqh",
+    fekah: "fiqh",
+    fiqah: "fiqh",
+    fikah: "fiqh",
+    fikh: "fiqh",
+    syariat: "syariah",
+    shariah: "syariah",
+    sharia: "syariah",
+    syarak: "syariah",
+    hadis: "hadis",
+    hadith: "hadis",
+    hadist: "hadis",
+    sunnah: "sunnah",
+    sunah: "sunnah",
+    solat: "solat",
+    shalat: "solat",
+    sembahyang: "solat",
+    zakah: "zakat",
+    zakaat: "zakat",
+    ramadhan: "ramadan",
+    ramadzan: "ramadan",
+    iddah: "idah",
+    eddah: "idah",
+    idah: "idah",
+  };
+
+  return aliases[word] || word;
+}
+
+function lightMalayLemma(word: string): string {
+  let lemma = canonicalizeFiqhTerm(word);
+  const protectedTerms = new Set([
+    "quran", "alquran", "hadis", "sunnah", "syariah", "fiqh", "zakat", "solat",
+    "puasa", "ramadan", "idah", "nikah", "rujuk", "talak", "wakaf", "riba",
+    "qiyas", "ijma", "ijtihad", "syafii", "jakim", "mufti"
+  ]);
+  if (protectedTerms.has(lemma)) return lemma;
+  if (lemma.length <= 4) return lemma;
+
+  for (const suffix of ["nyakah", "nyalah", "kah", "lah", "pun", "nya", "kan", "an", "i"]) {
+    if (lemma.endsWith(suffix) && lemma.length - suffix.length >= 4) {
+      lemma = lemma.slice(0, -suffix.length);
+      break;
+    }
+  }
+
+  for (const prefix of ["memper", "diper", "meng", "meny", "men", "mem", "ber", "ter", "per", "peng", "peny", "pen", "pem", "di", "ke", "se"]) {
+    if (lemma.startsWith(prefix) && lemma.length - prefix.length >= 4) {
+      lemma = lemma.slice(prefix.length);
+      break;
+    }
+  }
+
+  return canonicalizeFiqhTerm(lemma);
+}
+
+function normalizeQueryForCache(input: string): string {
+  const normalized = normalizeTextForSearch(input);
+  if (!QUERY_NORMALIZATION_ENABLED) return normalized;
+
+  return normalized
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(lightMalayLemma)
+    .join(" ");
+}
+
+function searchableText(input: string): string {
+  const normalized = normalizeTextForSearch(input);
+  if (!QUERY_NORMALIZATION_ENABLED) return normalized;
+  const lemmas = normalized.split(/\s+/).filter(Boolean).map(lightMalayLemma).join(" ");
+  return `${normalized} ${lemmas}`.trim();
+}
+
+function chatResponseCacheKey(message: string, history: any[]): string | null {
+  if (!CACHE_ENABLED || CHAT_RESPONSE_CACHE_TTL_MS <= 0) return null;
+  if (String(message || "").length > 1000) return null;
+
+  const normalizedHistory = (Array.isArray(history) ? history : [])
+    .slice(-6)
+    .map((item: any) => ({
+      role: item?.role === "user" ? "user" : "model",
+      content: normalizeTextForSearch(String(item?.content || "")).slice(0, 2000),
+    }));
+
+  return cacheKey("chat-response", {
+    cacheVersion: 1,
+    knowledgeVersion: knowledgeCacheVersion,
+    model: CHAT_MODEL,
+    message: normalizeTextForSearch(message),
+    history: normalizedHistory,
+  });
+}
+
+function markKnowledgeChanged(): void {
+  knowledgeCacheVersion += 1;
+  vectorRetrievalCache.clear();
+  graphRetrievalCache.clear();
+  chatResponseCache.clear();
 }
 
 function documentIdFor(document: CrawledDocument): string {
@@ -917,11 +1270,29 @@ function getEmbeddingModelName(): string {
 }
 
 async function generateTextEmbedding(ai: GoogleGenAI, content: string): Promise<number[]> {
+  const key = cacheKey("embedding", {
+    model: getEmbeddingModelName(),
+    input: normalizeQueryForCache(content),
+  });
+  const cached = embeddingCache.get(key);
+  if (cached) return cached;
+
+  const sharedCached = await getSharedJsonCache<number[]>("embedding", key);
+  if (sharedCached) {
+    embeddingCache.set(key, sharedCached);
+    return sharedCached;
+  }
+
   const embedResponse = await ai.models.embedContent({
     model: getEmbeddingModelName(),
     contents: content,
   });
-  return embedResponse.embeddings?.[0]?.values || [];
+  const embedding = embedResponse.embeddings?.[0]?.values || [];
+  if (embedding.length > 0) {
+    embeddingCache.set(key, embedding);
+    await setSharedJsonCache("embedding", key, embedding, EMBEDDING_CACHE_TTL_MS);
+  }
+  return embedding;
 }
 
 async function runBigQuery(query: string, params?: Record<string, any>): Promise<any[]> {
@@ -1016,6 +1387,19 @@ async function ensureBigQueryKnowledgeStore(): Promise<boolean> {
           updated_at TIMESTAMP
         )
       `);
+      await runBigQuery(`
+        CREATE TABLE IF NOT EXISTS ${bqTableRef(BQ_FEEDBACK_TABLE)} (
+          event_id STRING NOT NULL,
+          message_id STRING,
+          response_id STRING,
+          rating STRING,
+          prompt STRING,
+          response STRING,
+          citations_json STRING,
+          user_agent STRING,
+          created_at TIMESTAMP
+        )
+      `);
 
       try {
         await runBigQuery(`ALTER TABLE ${bqTableRef(BQ_CORPUS_TABLE)} ADD COLUMN IF NOT EXISTS content_hash STRING`);
@@ -1045,6 +1429,35 @@ async function ensureBigQueryKnowledgeStore(): Promise<boolean> {
     });
   }
   return bigQueryInitPromise;
+}
+
+function isValidFeedbackRating(value: any): value is "up" | "down" {
+  return value === "up" || value === "down";
+}
+
+async function storeResponseFeedback(event: ResponseFeedbackEvent): Promise<GcpPipelineStatus> {
+  if (!isGcpNativeConfigured()) {
+    fallbackFeedbackEvents = [event, ...fallbackFeedbackEvents].slice(0, 500);
+    return "SKIPPED_NOT_CONFIGURED";
+  }
+
+  await ensureBigQueryKnowledgeStore();
+  const client = getBigQueryClient();
+  if (!client) return "SKIPPED_NOT_CONFIGURED";
+
+  await client.dataset(BQ_DATASET).table(BQ_FEEDBACK_TABLE).insert([{
+    event_id: event.eventId,
+    message_id: event.messageId,
+    response_id: event.responseId,
+    rating: event.rating,
+    prompt: event.prompt,
+    response: event.response,
+    citations_json: event.citationsJson,
+    user_agent: event.userAgent,
+    created_at: event.createdAt,
+  }], { ignoreUnknownValues: true } as any);
+
+  return "SUCCESS";
 }
 
 async function uploadRawMarkdownToGCS(document: CrawledDocument, documentId: string, contentHash: string, crawlBatchId: string): Promise<{ status: GcpPipelineStatus; uri?: string }> {
@@ -1856,9 +2269,10 @@ function chunkCitation(chunk: RetrievedChunk): Citation {
 }
 
 function getTextKeywordMatches(text: string, keywords: string[]): string[] {
-  const normalized = text.toLowerCase();
+  const normalized = searchableText(text);
   return keywords.filter(keyword => {
-    const escapedKeyword = keyword.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedKeyword = normalizeQueryForCache(keyword).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (!escapedKeyword) return false;
     const keywordPattern = new RegExp(`(^|[^a-z0-9])${escapedKeyword}([^a-z0-9]|$)`, "i");
     return keywordPattern.test(normalized);
   });
@@ -1891,6 +2305,20 @@ async function searchBigQueryVectorChunks(ai: GoogleGenAI, message: string, limi
   if (!isGcpNativeConfigured()) return [];
 
   try {
+    const key = cacheKey("vector-retrieval", {
+      version: knowledgeCacheVersion,
+      model: getEmbeddingModelName(),
+      query: normalizeQueryForCache(message),
+      limit,
+    });
+    const cached = vectorRetrievalCache.get(key);
+    if (cached) return cached;
+    const sharedCached = await getSharedJsonCache<RetrievedChunk[]>("vector-retrieval", key);
+    if (sharedCached) {
+      vectorRetrievalCache.set(key, sharedCached);
+      return sharedCached;
+    }
+
     await ensureBigQueryKnowledgeStore();
     const queryEmbedding = await generateTextEmbedding(ai, message);
     if (queryEmbedding.length === 0) return [];
@@ -1918,7 +2346,7 @@ async function searchBigQueryVectorChunks(ai: GoogleGenAI, message: string, limi
         ORDER BY distance ASC
       `, { queryEmbedding, limit });
 
-      return rows.map(row => ({
+      const chunks = rows.map(row => ({
         content: row.content || "",
         title: row.title || row.source_url || "BigQuery source",
         sourceUrl: row.source_url || "",
@@ -1928,6 +2356,9 @@ async function searchBigQueryVectorChunks(ai: GoogleGenAI, message: string, limi
         metadataJson: row.metadata_json,
         score: typeof row.distance === "number" ? row.distance : undefined,
       }));
+      vectorRetrievalCache.set(key, chunks);
+      await setSharedJsonCache("vector-retrieval", key, chunks, RETRIEVAL_CACHE_TTL_MS);
+      return chunks;
     } catch (vectorErr: any) {
       console.warn("BigQuery VECTOR_SEARCH unavailable, using exact SQL cosine fallback:", vectorErr.message);
       const rows = await runBigQuery(`
@@ -1958,7 +2389,7 @@ async function searchBigQueryVectorChunks(ai: GoogleGenAI, message: string, limi
         LIMIT @limit
       `, { queryEmbedding, limit });
 
-      return rows.map(row => ({
+      const chunks = rows.map(row => ({
         content: row.content || "",
         title: row.title || row.source_url || "BigQuery source",
         sourceUrl: row.source_url || "",
@@ -1968,6 +2399,9 @@ async function searchBigQueryVectorChunks(ai: GoogleGenAI, message: string, limi
         metadataJson: row.metadata_json,
         score: typeof row.similarity === "number" ? row.similarity : undefined,
       }));
+      vectorRetrievalCache.set(key, chunks);
+      await setSharedJsonCache("vector-retrieval", key, chunks, RETRIEVAL_CACHE_TTL_MS);
+      return chunks;
     }
   } catch (err: any) {
     console.error("BigQuery vector retrieval failed:", err.message);
@@ -1979,8 +2413,22 @@ async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10
   if (!isGcpNativeConfigured() || keywords.length === 0) return [];
 
   try {
+    const selectedKeywords = Array.from(new Set(keywords.map(keyword => normalizeQueryForCache(keyword)).filter(Boolean)))
+      .slice(0, 4);
+    const key = cacheKey("graph-retrieval", {
+      version: knowledgeCacheVersion,
+      keywords: selectedKeywords,
+      limit,
+    });
+    const cached = graphRetrievalCache.get(key);
+    if (cached) return cached;
+    const sharedCached = await getSharedJsonCache<RetrievedGraphTriple[]>("graph-retrieval", key);
+    if (sharedCached) {
+      graphRetrievalCache.set(key, sharedCached);
+      return sharedCached;
+    }
+
     await ensureBigQueryKnowledgeStore();
-    const selectedKeywords = keywords.slice(0, 4).map(keyword => keyword.toLowerCase());
     const rows = await runBigQuery(`
       SELECT DISTINCT
         source_id,
@@ -2008,7 +2456,7 @@ async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10
       LIMIT @limit
     `, { keywords: selectedKeywords, limit });
 
-    return rows
+    const triples = rows
       .filter(row => row.source_id && row.target_id)
       .map(row => {
         const sourceNode: KnowledgeNode = {
@@ -2039,6 +2487,9 @@ async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10
           },
         };
       });
+    graphRetrievalCache.set(key, triples);
+    await setSharedJsonCache("graph-retrieval", key, triples, RETRIEVAL_CACHE_TTL_MS);
+    return triples;
   } catch (err: any) {
     console.error("BigQuery graph retrieval failed:", err.message);
     return [];
@@ -2245,11 +2696,22 @@ async function runCrawl4AiBridge(source: CrawlSource | undefined, url: string, m
   return documents;
 }
 
-async function extractCleanContent(url: string, ai: GoogleGenAI): Promise<{ title: string; content: string; crawler: string }> {
+function getErrorMessage(err: any): string {
+  const parts = [err?.message, err?.cause?.message, err?.cause?.code].filter(Boolean);
+  return parts.length > 0 ? parts.join(" / ") : String(err);
+}
+
+async function fetchHtmlWithNode(url: string): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CRAWLER_HTTP_TIMEOUT_MS);
+
   try {
     const response = await fetch(url, {
+      signal: controller.signal,
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+        "User-Agent": CRAWLER_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ms-MY,ms;q=0.9,en-US;q=0.8,en;q=0.7"
       }
     });
 
@@ -2257,7 +2719,74 @@ async function extractCleanContent(url: string, ai: GoogleGenAI): Promise<{ titl
       throw new Error(`Kelemahan pelayan! Kod: ${response.status}`);
     }
 
-    const html = await response.text();
+    return await response.text();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchHtmlWithCurl(url: string): Promise<string> {
+  return await new Promise((resolve, reject) => {
+    const args = [
+      "-L",
+      "--silent",
+      "--show-error",
+      "--fail",
+      "--max-time",
+      String(Math.ceil(CRAWLER_HTTP_TIMEOUT_MS / 1000)),
+      "--connect-timeout",
+      "10",
+      "-A",
+      CRAWLER_USER_AGENT,
+      "-H",
+      "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "-H",
+      "Accept-Language: ms-MY,ms;q=0.9,en-US;q=0.8,en;q=0.7",
+      url
+    ];
+    const child = spawn("curl", args);
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", chunk => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", chunk => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", code => {
+      if (code === 0 && stdout.trim()) {
+        resolve(stdout);
+        return;
+      }
+      reject(new Error(stderr.trim() || `curl keluar dengan kod ${code}`));
+    });
+  });
+}
+
+async function fetchCrawlerHtml(url: string): Promise<{ html: string; transport: "node-fetch" | "curl" }> {
+  let nodeErr: any;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return { html: await fetchHtmlWithNode(url), transport: "node-fetch" };
+    } catch (err: any) {
+      nodeErr = err;
+      console.warn(`Node fetch attempt ${attempt} failed for ${url}:`, getErrorMessage(err));
+    }
+  }
+
+  try {
+    return { html: await fetchHtmlWithCurl(url), transport: "curl" };
+  } catch (curlErr: any) {
+    throw new Error(`node-fetch: ${getErrorMessage(nodeErr)}; curl: ${getErrorMessage(curlErr)}`);
+  }
+}
+
+async function extractCleanContent(url: string, ai: GoogleGenAI): Promise<{ title: string; content: string; crawler: string }> {
+  try {
+    const { html, transport } = await fetchCrawlerHtml(url);
 
     // Strip heavy layout tags before sending to LLM
     let cleanHtml = html
@@ -2294,11 +2823,11 @@ ${cleanHtml.substring(0, 32000)}`,
     return {
       title: result.title || "Rujukan Kontemporari",
       content: result.content || "",
-      crawler: "gemini-html"
+      crawler: `gemini-html-${transport}`
     };
   } catch (err: any) {
-    console.error(`Crawler Error for ${url}:`, err.message);
-    throw new Error(`Gagal melayari atau mengekstrak kandungan: ${err.message}`);
+    console.error(`Crawler Error for ${url}:`, getErrorMessage(err));
+    throw new Error(`Gagal melayari atau mengekstrak kandungan: ${getErrorMessage(err)}`);
   }
 }
 
@@ -2359,13 +2888,11 @@ function extractKeywords(text: string): string[] {
     "jawab", "ringkas", "sertakan", "asas", "rujukan", "sumber", "rasmi", "katalog", "mursyid", "berdasarkan"
   ]);
   
-  const cleaned = text.toLowerCase()
-    .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, " ")
-    .replace(/\s+/g, " ");
-    
-  return cleaned.split(/\s+/)
+  return Array.from(new Set(normalizeTextForSearch(text)
+    .split(/\s+/)
+    .map(word => QUERY_NORMALIZATION_ENABLED ? lightMalayLemma(word.trim()) : word.trim())
     .map(word => word.trim())
-    .filter(word => word.length > 3 && !stopwords.has(word));
+    .filter(word => word.length > 3 && !stopwords.has(word))));
 }
 
 function searchFallbackGraph(keywords: string[]): RetrievedGraphTriple[] {
@@ -2566,6 +3093,7 @@ async function ingestDocumentContent(document: CrawledDocument, ai: GoogleGenAI,
 
   const gcpStatus = await persistGcpNativeKnowledge(document, documentId, contentHash, crawlBatchId, preparedChunks, graphData);
   mergeGraphIntoMemory(graphData);
+  markKnowledgeChanged();
 
   return {
     chunksCount,
@@ -2780,9 +3308,21 @@ app.post("/api/feedback/:id/improvement", async (req, res) => {
 // 1. Chat endpoint with TRUE Hybrid GraphRAG Grounding & customized Shafi'i context
 app.post("/api/chat", async (req, res) => {
   try {
-    const { message, history } = req.body;
+    const { message, history, noCache } = req.body;
     if (!message) {
       return res.status(400).json({ error: "Mesej diperlukan." });
+    }
+
+    const responseCacheKey = noCache ? null : chatResponseCacheKey(message, history);
+    let cachedResponse = responseCacheKey ? chatResponseCache.get(responseCacheKey) : undefined;
+    if (!cachedResponse && responseCacheKey) {
+      cachedResponse = await getSharedJsonCache<ChatCacheValue>("chat-response", responseCacheKey);
+      if (cachedResponse) {
+        chatResponseCache.set(responseCacheKey, cachedResponse);
+      }
+    }
+    if (cachedResponse) {
+      return res.json({ ...cachedResponse, cache: { hit: true, type: "chat-response" } });
     }
 
     const ai = getGeminiClient();
@@ -2840,13 +3380,22 @@ app.post("/api/chat", async (req, res) => {
     }
 
     if (isGcpNativeConfigured() && !groundedContext) {
+      const text =
+        "Katalog pengetahuan Mursyid (BigQuery/Knowledge Catalog) tidak memulangkan konteks yang cukup relevan untuk soalan ini. " +
+        "Saya tidak akan membuat kesimpulan hukum khusus atau mereka-reka rujukan di luar korpus yang telah diimbas. " +
+        "Sila imbas portal rasmi berkaitan dahulu, kemudian tanya semula supaya jawapan boleh disandarkan kepada sumber yang mempunyai metadata dan sitasi.";
+      const emptyGraph = emptyRelevantGraph();
+      const responseId = hashId(`${message}:${text}`);
+      if (responseCacheKey) {
+        chatResponseCache.set(responseCacheKey, { text, citations: [], relevantGraph: emptyGraph, responseId });
+        await setSharedJsonCache("chat-response", responseCacheKey, { text, citations: [], relevantGraph: emptyGraph, responseId }, CHAT_RESPONSE_CACHE_TTL_MS);
+      }
       return res.json({
-        text:
-          "Katalog pengetahuan Mursyid (BigQuery/Knowledge Catalog) tidak memulangkan konteks yang cukup relevan untuk soalan ini. " +
-          "Saya tidak akan membuat kesimpulan hukum khusus atau mereka-reka rujukan di luar korpus yang telah diimbas. " +
-          "Sila imbas portal rasmi berkaitan dahulu, kemudian tanya semula supaya jawapan boleh disandarkan kepada sumber yang mempunyai metadata dan sitasi.",
+        text,
         citations: [],
-        relevantGraph: emptyRelevantGraph(),
+        relevantGraph: emptyGraph,
+        responseId,
+        cache: { hit: false },
       });
     }
 
@@ -2887,7 +3436,8 @@ app.post("/api/chat", async (req, res) => {
         res.write(`${JSON.stringify(event)}\n`);
       };
 
-      writeEvent({ type: "metadata", citations, relevantGraph });
+      const responseIdSeed = hashId(`${message}:${Date.now()}`);
+      writeEvent({ type: "metadata", citations, relevantGraph, responseId: responseIdSeed });
 
       let streamedText = "";
       const stream = await ai.models.generateContentStream({
@@ -2906,7 +3456,13 @@ app.post("/api/chat", async (req, res) => {
         writeEvent({ type: "text", text: chunkText });
       }
 
-      writeEvent({ type: "done", text: streamedText || "Maaf, tiada jawapan dijana." });
+      const text = streamedText || "Maaf, tiada jawapan dijana.";
+      const responseId = hashId(`${message}:${text}`);
+      if (responseCacheKey) {
+        chatResponseCache.set(responseCacheKey, { text, citations, relevantGraph, responseId });
+        await setSharedJsonCache("chat-response", responseCacheKey, { text, citations, relevantGraph, responseId }, CHAT_RESPONSE_CACHE_TTL_MS);
+      }
+      writeEvent({ type: "done", text, responseId });
       res.end();
       return;
     }
@@ -2921,14 +3477,55 @@ app.post("/api/chat", async (req, res) => {
     });
 
     const text = response.text || "Maaf, tiada jawapan dijana.";
+    const responseId = hashId(`${message}:${text}`);
 
-    res.json({ text, citations, relevantGraph });
+    if (responseCacheKey) {
+      chatResponseCache.set(responseCacheKey, { text, citations, relevantGraph, responseId });
+      await setSharedJsonCache("chat-response", responseCacheKey, { text, citations, relevantGraph, responseId }, CHAT_RESPONSE_CACHE_TTL_MS);
+    }
+
+    res.json({ text, citations, relevantGraph, responseId, cache: { hit: false } });
   } catch (error: any) {
     console.error("Chat Error:", error);
     res.status(500).json({ 
       error: error.message || "An unexpected error occurred",
       needsAdc: !isAdcConfigured()
     });
+  }
+});
+
+app.post("/api/feedback", async (req, res) => {
+  try {
+    const { messageId, responseId, rating, prompt, response, citations } = req.body || {};
+    if (!isValidFeedbackRating(rating)) {
+      return res.status(400).json({ error: "Rating maklum balas tidak sah." });
+    }
+    if (!response && !responseId) {
+      return res.status(400).json({ error: "Response diperlukan untuk maklum balas." });
+    }
+
+    const createdAt = new Date().toISOString();
+    const event: ResponseFeedbackEvent = {
+      eventId: hashId(`${messageId || ""}:${responseId || ""}:${rating}:${createdAt}`, 24),
+      messageId: truncateText(String(messageId || ""), 128),
+      responseId: truncateText(String(responseId || ""), 128),
+      rating,
+      prompt: truncateText(String(prompt || ""), 4000),
+      response: truncateText(String(response || ""), 12000),
+      citationsJson: truncateText(safeJson(Array.isArray(citations) ? citations : []), 8000),
+      userAgent: truncateText(String(req.headers["user-agent"] || ""), 512),
+      createdAt,
+    };
+
+    const storageStatus = await storeResponseFeedback(event);
+    res.json({
+      success: true,
+      storageStatus,
+      fallbackCount: fallbackFeedbackEvents.length,
+    });
+  } catch (error: any) {
+    console.error("Feedback Error:", error);
+    res.status(500).json({ error: error.message || "Gagal menyimpan maklum balas." });
   }
 });
 
@@ -2954,11 +3551,13 @@ app.post("/api/reset-graph", async (req, res) => {
     if (nativeGraph) {
       fallbackNodes = JSON.parse(JSON.stringify(INITIAL_NODES));
       fallbackLinks = JSON.parse(JSON.stringify(INITIAL_LINKS));
+      markKnowledgeChanged();
       return res.json(nativeGraph);
     }
 
     fallbackNodes = JSON.parse(JSON.stringify(INITIAL_NODES));
     fallbackLinks = JSON.parse(JSON.stringify(INITIAL_LINKS));
+    markKnowledgeChanged();
     res.json({ nodes: fallbackNodes, links: fallbackLinks });
   } catch (error: any) {
     console.error("Reset Graph Error:", error);
@@ -2993,23 +3592,46 @@ app.post("/api/ingest-url", async (req, res) => {
 app.get("/api/crawl-sources", (req, res) => {
   res.json({
     sources: SOURCE_PORTALS,
-	    config: {
-	      crawler: INGESTION_CRAWLER,
-	      maxDepth: CRAWL_MAX_DEPTH,
-	      maxPagesPerSource: CRAWL_MAX_PAGES_PER_SOURCE,
-	      gcpNativeEnabled: isGcpNativeConfigured(),
-	      gcpProjectId: GCP_PROJECT_ID,
-	      gcpLocation: GCP_LOCATION,
-	      bigQueryDataset: BQ_DATASET,
-	      bigQueryCorpusTable: BQ_CORPUS_TABLE,
-	      bigQueryChunksTable: BQ_CHUNKS_TABLE,
-	      bigQueryGraphTable: BQ_GRAPH_TABLE,
-	      bigQueryCrawlRunsTable: BQ_CRAWL_RUNS_TABLE,
-	      bigQueryEmbeddingModel: BQ_EMBEDDING_MODEL,
-	      cloudStorageRawBucket: GCS_RAW_BUCKET,
-	      knowledgeCatalogEntryGroup: KNOWLEDGE_CATALOG_ENTRY_GROUP
-	    }
-	  });
+    config: {
+      crawler: INGESTION_CRAWLER,
+      maxDepth: CRAWL_MAX_DEPTH,
+      maxPagesPerSource: CRAWL_MAX_PAGES_PER_SOURCE,
+      gcpNativeEnabled: isGcpNativeConfigured(),
+      gcpProjectId: GCP_PROJECT_ID,
+      gcpLocation: GCP_LOCATION,
+      bigQueryDataset: BQ_DATASET,
+      bigQueryCorpusTable: BQ_CORPUS_TABLE,
+      bigQueryChunksTable: BQ_CHUNKS_TABLE,
+      bigQueryGraphTable: BQ_GRAPH_TABLE,
+      bigQueryCrawlRunsTable: BQ_CRAWL_RUNS_TABLE,
+      bigQueryFeedbackTable: BQ_FEEDBACK_TABLE,
+      bigQueryEmbeddingModel: BQ_EMBEDDING_MODEL,
+      cloudStorageRawBucket: GCS_RAW_BUCKET,
+      knowledgeCatalogEntryGroup: KNOWLEDGE_CATALOG_ENTRY_GROUP,
+      cacheEnabled: CACHE_ENABLED,
+      queryNormalizationEnabled: QUERY_NORMALIZATION_ENABLED,
+      sharedCacheEnabled: SHARED_CACHE_ENABLED,
+      sharedCacheConfigured: isSharedCacheConfigured(),
+    }
+  });
+});
+
+app.get("/api/cache-status", (_req, res) => {
+  res.json({
+    enabled: CACHE_ENABLED,
+    queryNormalizationEnabled: QUERY_NORMALIZATION_ENABLED,
+    sharedCacheEnabled: SHARED_CACHE_ENABLED,
+    sharedCacheConfigured: isSharedCacheConfigured(),
+    sharedCacheHostConfigured: Boolean(REDIS_HOST),
+    knowledgeCacheVersion,
+    caches: {
+      embeddings: embeddingCache.stats(),
+      vectorRetrieval: vectorRetrievalCache.stats(),
+      graphRetrieval: graphRetrievalCache.stats(),
+      chatResponses: chatResponseCache.stats(),
+      sharedRedis: sharedCacheStats,
+    },
+  });
 });
 
 app.get("/api/crawl-logs", async (req, res) => {
@@ -3021,23 +3643,28 @@ app.get("/api/crawl-logs", async (req, res) => {
     logs,
     sources: SOURCE_PORTALS,
     total: SOURCE_PORTALS.length,
-	    config: {
-	      crawler: INGESTION_CRAWLER,
-	      maxDepth: CRAWL_MAX_DEPTH,
-	      maxPagesPerSource: CRAWL_MAX_PAGES_PER_SOURCE,
-	      gcpNativeEnabled: isGcpNativeConfigured(),
-	      gcpProjectId: GCP_PROJECT_ID,
-	      gcpLocation: GCP_LOCATION,
-	      bigQueryDataset: BQ_DATASET,
-	      bigQueryCorpusTable: BQ_CORPUS_TABLE,
-	      bigQueryChunksTable: BQ_CHUNKS_TABLE,
-	      bigQueryGraphTable: BQ_GRAPH_TABLE,
-	      bigQueryCrawlRunsTable: BQ_CRAWL_RUNS_TABLE,
-	      bigQueryEmbeddingModel: BQ_EMBEDDING_MODEL,
-	      cloudStorageRawBucket: GCS_RAW_BUCKET,
-	      knowledgeCatalogEntryGroup: KNOWLEDGE_CATALOG_ENTRY_GROUP
-	    }
-	  });
+    config: {
+      crawler: INGESTION_CRAWLER,
+      maxDepth: CRAWL_MAX_DEPTH,
+      maxPagesPerSource: CRAWL_MAX_PAGES_PER_SOURCE,
+      gcpNativeEnabled: isGcpNativeConfigured(),
+      gcpProjectId: GCP_PROJECT_ID,
+      gcpLocation: GCP_LOCATION,
+      bigQueryDataset: BQ_DATASET,
+      bigQueryCorpusTable: BQ_CORPUS_TABLE,
+      bigQueryChunksTable: BQ_CHUNKS_TABLE,
+      bigQueryGraphTable: BQ_GRAPH_TABLE,
+      bigQueryCrawlRunsTable: BQ_CRAWL_RUNS_TABLE,
+      bigQueryFeedbackTable: BQ_FEEDBACK_TABLE,
+      bigQueryEmbeddingModel: BQ_EMBEDDING_MODEL,
+      cloudStorageRawBucket: GCS_RAW_BUCKET,
+      knowledgeCatalogEntryGroup: KNOWLEDGE_CATALOG_ENTRY_GROUP,
+      cacheEnabled: CACHE_ENABLED,
+      queryNormalizationEnabled: QUERY_NORMALIZATION_ENABLED,
+      sharedCacheEnabled: SHARED_CACHE_ENABLED,
+      sharedCacheConfigured: isSharedCacheConfigured(),
+    }
+  });
 });
 
 app.post("/api/ingest-batch", async (req, res) => {

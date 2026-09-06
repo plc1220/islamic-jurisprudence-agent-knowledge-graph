@@ -1,6 +1,6 @@
 # Incremental knowledge updates
 
-Implemented 2026-09-06. Not deployed or run against Gemini. The assistant builds the pipeline; Gemini `gemini-3.7-flash` generates the knowledge.
+Implemented 2026-09-06; deployed 2026-09-07. No corpus update or Gemini generation has been run. The assistant builds the pipeline; Gemini `gemini-3.7-flash` generates the knowledge.
 
 ## Admin flow
 
@@ -62,3 +62,23 @@ To restore a previous compatible prepared release, use `activate --run-id PREVIO
 Fourteen automated tests cover section coverage, exact evidence, stable IDs, cache invalidation, interrupted work, failed publication, storage preconditions, crawl reuse, orchestration, admin authentication, concurrent requests and graph evidence display. TypeScript and production builds pass. A live read-only inventory query confirmed access to stored corpus records. No real extraction, new crawling, publication or deployment was performed during implementation. Terraform validation requires Terraform, which is unavailable in this workspace.
 
 Final local API checks returned the configured model and the unchanged legacy graph (19 nodes, 17 links). The final browser pass was blocked by the locked Mac.
+
+## Deployment verified — 2026-09-07
+
+- App: https://mursyid-ai-heboslofda-as.a.run.app
+- Deployment: https://github.com/plc1220/islamic-jurisprudence-agent-knowledge-graph/actions/runs/34063595684 (successful, image commit `a109320`).
+- Background job: `mursyid-ai-knowledge-update`, deployed with no automatic retries and zero executions.
+- Admin code: Secret Manager `mursyid-knowledge-admin`, version 1. Its value is not stored in the repository. Repository variable `KNOWLEDGE_ADMIN_SECRET` points to it.
+- Runtime secret access and job-status permissions configured through authenticated Google Cloud APIs. The workflow configured job-scoped execution permission.
+- Live checks: secure admin sign-in and authenticated status passed; anonymous update returned 403; library and Markdown download passed; graph returned the existing 19 nodes and 17 links.
+- Browser verification remained blocked by the locked Mac. No crawl, extraction or publication was triggered.
+
+Before a future Terraform apply, adopt the role and bindings created during deployment into the existing infrastructure state (do not recreate the role):
+
+```sh
+terraform import google_project_iam_custom_role.knowledge_job_status projects/my-rd-coe-demo-gen-ai/roles/mursyidKnowledgeJobStatus
+terraform import google_project_iam_member.knowledge_job_status 'my-rd-coe-demo-gen-ai projects/my-rd-coe-demo-gen-ai/roles/mursyidKnowledgeJobStatus serviceAccount:mursyid-runtime@my-rd-coe-demo-gen-ai.iam.gserviceaccount.com'
+terraform import -var='knowledge_admin_secret=mursyid-knowledge-admin' 'google_secret_manager_secret_iam_member.knowledge_admin_reader[0]' 'projects/my-rd-coe-demo-gen-ai/secrets/mursyid-knowledge-admin roles/secretmanager.secretAccessor serviceAccount:mursyid-runtime@my-rd-coe-demo-gen-ai.iam.gserviceaccount.com'
+```
+
+Run these from `infra/` with the project's normal backend and variable settings. Keep `knowledge_admin_secret=mursyid-knowledge-admin` in that deployment's variable configuration.

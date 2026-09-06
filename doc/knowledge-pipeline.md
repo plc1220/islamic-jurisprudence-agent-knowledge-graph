@@ -1,6 +1,6 @@
 # Incremental knowledge updates
 
-Implemented 2026-09-06; deployed 2026-09-07. No corpus update or Gemini generation has been run. The assistant builds the pipeline; Gemini `gemini-3.7-flash` generates the knowledge.
+Implemented 2026-09-06; deployed 2026-09-07. The first saved-corpus Gemini extraction was started on 2026-09-07; see the run record below. The assistant builds the pipeline; Gemini `gemini-3.7-flash` generates the knowledge.
 
 ## Admin flow
 
@@ -82,3 +82,18 @@ terraform import -var='knowledge_admin_secret=mursyid-knowledge-admin' 'google_s
 ```
 
 Run these from `infra/` with the project's normal backend and variable settings. Keep `knowledge_admin_secret=mursyid-knowledge-admin` in that deployment's variable configuration.
+
+## First extraction started — 2026-09-07
+
+User authorized Gemini extraction and graph publication from the saved corpus. No crawling was invoked.
+
+The first run was cancelled after it exposed missing node-type constraints in the model schema. The corrected pipeline explicitly supplies the allowed types and exact-quote rules, with useful validation feedback. A saved article then produced seven validated claims across four sections. Those artifacts are reusable by the full run. Tests and TypeScript checks pass.
+
+Corrected deployment: `8b4b253`, GitHub run `34066324850`.
+
+Current saved-corpus run: `saved-880674f8-dc1d-4775-ba2d-ba96abc7f97a`.
+Cloud Run execution: `mursyid-ai-knowledge-update-lcjr8`.
+Frozen selection: 6,020 documents after ID/URL deduplication.
+Status when recorded: extraction running; not yet published. The prior graph remains active until validation and atomic publication succeed.
+
+The operator command `npx tsx scripts/start-saved-knowledge.ts --start` registers a single update and dispatches `scripts/saved-knowledge-worker.cjs` through the deployed job. It skips crawling, runs the existing extraction CLI, and publishes only after successful validation. Do not start a duplicate while this run is active. The normal admin action still includes discovery of new sources.

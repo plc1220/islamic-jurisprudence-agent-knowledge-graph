@@ -1,4 +1,8 @@
 import express from "express";
+import { registerKnowledgeRoutes } from "./scripts/knowledge/routes";
+import { CloudStore, PREFIX, validateRelease, type Release } from "./scripts/knowledge/cloud";
+import { MODEL as KNOWLEDGE_MODEL } from "./scripts/knowledge/core";
+import { buildGraphView, readEvidence } from "./scripts/knowledge/view";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
@@ -20,7 +24,7 @@ dotenv.config();
 let modelConfig = {
   CRAWLER_MODEL: "gemini-3.1-flash-lite",
   CHAT_MODEL: "gemini-3.1-flash-lite",
-  EXTRACTOR_MODEL: "gemini-3.5-flash"
+  EXTRACTOR_MODEL: "gemini-3.7-flash"
 };
 
 try {
@@ -83,6 +87,7 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 
 app.set("trust proxy", 1);
 app.use(express.json());
+registerKnowledgeRoutes(app);
 
 // ==========================================
 // PRISTINE ISLAMIC ONTOLOGY BASELINE
@@ -228,7 +233,7 @@ type SessionChatMessage = {
   prompt?: string;
 };
 type PersistedSessionState = {
-  activeTab?: "chat" | "graph" | "sources" | "analytics" | "review" | "engineering";
+  activeTab?: "chat" | "graph" | "sources" | "analytics" | "review" | "curation" | "ingest" | "engineering";
   graphSubTab?: "visualize" | "ingest";
   isAgentInfoOpen?: boolean;
   selectedNodeId?: string | null;
@@ -399,7 +404,7 @@ const memorySessions = new Map<string, { state: PersistedSessionState; expiresAt
 let redisClient: ReturnType<typeof createClient> | null = null;
 let redisConnectPromise: Promise<void> | null = null;
 
-const validTabs = new Set(["chat", "graph", "sources", "analytics", "review", "engineering"]);
+const validTabs = new Set(["curation", "ingest", "chat", "graph", "sources", "analytics", "review", "engineering"]);
 const validGraphSubTabs = new Set(["visualize", "ingest"]);
 
 function parseCookieHeader(header?: string): Record<string, string> {
@@ -1193,7 +1198,7 @@ function searchableText(input: string): string {
   return `${normalized} ${lemmas}`.trim();
 }
 
-function chatResponseCacheKey(message: string, history: any[]): string | null {
+function chatResponseCacheKey(message: string, history: any[], graphVersion = "legacy"): string | null {
   if (!CACHE_ENABLED || CHAT_RESPONSE_CACHE_TTL_MS <= 0) return null;
   if (String(message || "").length > 1000) return null;
 
@@ -1205,7 +1210,8 @@ function chatResponseCacheKey(message: string, history: any[]): string | null {
     }));
 
   return cacheKey("chat-response", {
-    cacheVersion: 1,
+    cacheVersion: 2,
+    graphVersion,
     knowledgeVersion: knowledgeCacheVersion,
     model: CHAT_MODEL,
     message: normalizeTextForSearch(message),
@@ -1218,6 +1224,27 @@ function markKnowledgeChanged(): void {
   vectorRetrievalCache.clear();
   graphRetrievalCache.clear();
   chatResponseCache.clear();
+}
+
+// Readers poll a small release pointer, not the corpus. A request pins one release.
+let activeGraphRelease: Release | null = null;
+let graphReleaseCheckedAt = 0;
+let graphReleaseCheck: Promise<Release | null> | null = null;
+async function resolveGraphRelease(): Promise<Release | null> {
+  const bucket = process.env.KNOWLEDGE_PIPELINE_BUCKET || GCS_RAW_BUCKET;
+  if (!GCP_PROJECT_ID || !bucket) return null;
+  if (Date.now() - graphReleaseCheckedAt < 15000) return activeGraphRelease;
+  if (graphReleaseCheck) return graphReleaseCheck;
+  graphReleaseCheck = (async () => {
+    const store = new CloudStore(new Storage({ projectId: GCP_PROJECT_ID }), bucket, PREFIX);
+    const release = await store.read<Release>('active.json');
+    if (release) validateRelease(release);
+    if ((release?.version || 'legacy') !== (activeGraphRelease?.version || 'legacy')) markKnowledgeChanged();
+    activeGraphRelease = release;
+    graphReleaseCheckedAt = Date.now();
+    return release;
+  })();
+  try { return await graphReleaseCheck; } finally { graphReleaseCheck = null; }
 }
 
 function documentIdFor(document: CrawledDocument): string {
@@ -2409,7 +2436,7 @@ async function searchBigQueryVectorChunks(ai: GoogleGenAI, message: string, limi
   }
 }
 
-async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10): Promise<RetrievedGraphTriple[]> {
+async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10, release: Release | null = null): Promise<RetrievedGraphTriple[]> {
   if (!isGcpNativeConfigured() || keywords.length === 0) return [];
 
   try {
@@ -2417,6 +2444,7 @@ async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10
       .slice(0, 4);
     const key = cacheKey("graph-retrieval", {
       version: knowledgeCacheVersion,
+      graphVersion: release?.version || "legacy",
       keywords: selectedKeywords,
       limit,
     });
@@ -2428,7 +2456,6 @@ async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10
       return sharedCached;
     }
 
-    await ensureBigQueryKnowledgeStore();
     const rows = await runBigQuery(`
       SELECT DISTINCT
         source_id,
@@ -2442,8 +2469,8 @@ async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10
         target_description,
         source_url,
         document_id,
-        JSON_VALUE(metadata_json, '$.title') AS title
-      FROM ${bqTableRef(BQ_GRAPH_TABLE)}
+        JSON_VALUE(metadata_json, '$.title') AS title, metadata_json
+      FROM ${bqTableRef(release?.table || BQ_GRAPH_TABLE)}
       WHERE EXISTS (
         SELECT 1
         FROM UNNEST(@keywords) AS keyword
@@ -2453,6 +2480,7 @@ async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10
            OR LOWER(target_label) LIKE CONCAT('%', keyword, '%')
            OR LOWER(relation) LIKE CONCAT('%', keyword, '%')
       )
+      ORDER BY source_id, target_id, relation
       LIMIT @limit
     `, { keywords: selectedKeywords, limit });
 
@@ -2473,8 +2501,9 @@ async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10
         };
         const relation = row.relation || "RELATION";
 
+        const evidence = readEvidence(row);
         return {
-          text: `[Knowledge Catalog/BigQuery Graph] ${sourceNode.label} -> ${relation} -> ${targetNode.label} (${sourceNode.description || ""} | ${targetNode.description || ""})`,
+          text: `[Knowledge Catalog/BigQuery Graph] ${sourceNode.label} -> ${relation} -> ${targetNode.label} (${sourceNode.description || ""} | ${targetNode.description || ""})${evidence ? ` [Machine-extracted; not scholarly approval] Statement: ${evidence.statement} Quote: ${evidence.quote} Conditions: ${evidence.conditions} School: ${evidence.school} Authority: ${evidence.authority}` : ""}`,
           title: row.title || row.source_url || "Knowledge Catalog graph source",
           sourceUrl: row.source_url || "",
           documentId: row.document_id || "",
@@ -2496,92 +2525,18 @@ async function searchBigQueryGraphTriples(keywords: string[], limit: number = 10
   }
 }
 
-async function getFullGraphFromBigQuery(): Promise<{ nodes: KnowledgeNode[]; links: KnowledgeLink[] } | null> {
+async function getFullGraphFromBigQuery(search = "") {
   if (!isGcpNativeConfigured()) return null;
-
-  try {
-    await ensureBigQueryKnowledgeStore();
-    const rows = await runBigQuery(`
-      SELECT
-        source_id,
-        source_label,
-        source_type,
-        source_description,
-        target_id,
-        target_label,
-        target_type,
-        target_description,
-        relation
-      FROM ${bqTableRef(BQ_GRAPH_TABLE)}
-      LIMIT 1000
-    `);
-
-    if (rows.length === 0) return null;
-
-    const nodeMap = new Map<string, KnowledgeNode>();
-    const links: KnowledgeLink[] = [];
-    const linkKeys = new Set<string>();
-    for (const row of rows) {
-      if (row.source_id && !nodeMap.has(row.source_id)) {
-        nodeMap.set(row.source_id, {
-          id: row.source_id,
-          type: row.source_type || "Entity",
-          label: row.source_label || row.source_id,
-          description: row.source_description || "",
-        });
-      }
-      if (row.target_id && !nodeMap.has(row.target_id)) {
-        nodeMap.set(row.target_id, {
-          id: row.target_id,
-          type: row.target_type || "Entity",
-          label: row.target_label || row.target_id,
-          description: row.target_description || "",
-        });
-      }
-      if (row.source_id && row.target_id) {
-        const relation = row.relation || "RELATION";
-        const linkKey = `${row.source_id}::${relation}::${row.target_id}`;
-        if (linkKeys.has(linkKey)) continue;
-        linkKeys.add(linkKey);
-        links.push({
-          source: row.source_id,
-          target: row.target_id,
-          relation,
-        });
-      }
-    }
-
-    return { nodes: Array.from(nodeMap.values()), links };
-  } catch (err: any) {
-    console.error("BigQuery graph fetch failed:", err.message);
-    return null;
-  }
-}
-
-async function resetBigQueryGraph(): Promise<{ nodes: KnowledgeNode[]; links: KnowledgeLink[] } | null> {
-  if (!isGcpNativeConfigured()) return null;
-
-  try {
-    await ensureBigQueryKnowledgeStore();
-    await runBigQuery(`DELETE FROM ${bqTableRef(BQ_GRAPH_TABLE)} WHERE TRUE`);
-    const baselineDocument: CrawledDocument = {
-      url: "mursyid://baseline",
-      title: "Pristine Islamic Ontology Baseline",
-      content: "Baseline ontology seeded by Mursyid AI.",
-      crawler: "baseline",
-      sourceName: "Mursyid AI",
-      category: "website",
-    };
-	    const baselineGraph: GraphExtraction = {
-	      nodes: INITIAL_NODES as KnowledgeNode[],
-	      links: INITIAL_LINKS as KnowledgeLink[],
-	    };
-	    await writeRowsToBigQuery(baselineDocument, "baseline", contentHashForDocument(baselineDocument), "baseline-reset", [], baselineGraph, undefined);
-	    return { nodes: INITIAL_NODES as KnowledgeNode[], links: INITIAL_LINKS as KnowledgeLink[] };
-  } catch (err: any) {
-    console.error("BigQuery graph reset failed:", err.message);
-    return null;
-  }
+  const release = await resolveGraphRelease();
+  const rows = await runBigQuery(`
+    SELECT * FROM ${bqTableRef(release?.table || BQ_GRAPH_TABLE)}
+    WHERE (@search = '' OR STRPOS(LOWER(source_label), LOWER(@search)) > 0 OR STRPOS(LOWER(target_label), LOWER(@search)) > 0)
+    ORDER BY source_id, target_id, relation, edge_id
+    LIMIT 1001
+  `, { search });
+  return { ...buildGraphView(rows.slice(0, 1000)), truncated: rows.length > 1000,
+    version: release?.version || 'legacy', model: release?.model || null, totalEdges: release?.edges ?? null,
+    reviewStatus: release?.reviewStatus || 'legacy', search };
 }
 
 // ==========================================
@@ -3313,7 +3268,8 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: "Mesej diperlukan." });
     }
 
-    const responseCacheKey = noCache ? null : chatResponseCacheKey(message, history);
+    const graphRelease = await resolveGraphRelease();
+    const responseCacheKey = noCache ? null : chatResponseCacheKey(message, history, graphRelease?.version || "legacy");
     let cachedResponse = responseCacheKey ? chatResponseCache.get(responseCacheKey) : undefined;
     if (!cachedResponse && responseCacheKey) {
       cachedResponse = await getSharedJsonCache<ChatCacheValue>("chat-response", responseCacheKey);
@@ -3346,7 +3302,7 @@ app.post("/api/chat", async (req, res) => {
         console.log(`GCP Native Retrieval: BigQuery + Knowledge Catalog context search for: "${message}"`);
         const [rawVectorChunks, rawGraphTriples] = await Promise.all([
           searchBigQueryVectorChunks(ai, message, 5),
-          searchBigQueryGraphTriples(keywords),
+          searchBigQueryGraphTriples(keywords, 10, graphRelease),
         ]);
         const vectorChunks = filterRelevantChunks(rawVectorChunks, keywords).slice(0, 3);
         const graphTriples = filterRelevantTriples(rawGraphTriples, keywords);
@@ -3530,64 +3486,85 @@ app.post("/api/feedback", async (req, res) => {
 });
 
 // 2. Query the unified mesh graph state
+// Read-only access to saved content. Deduplicate for presentation; never mutate the corpus.
+const libraryCorpusSql = () => `SELECT * FROM ${bqTableRef(BQ_CORPUS_TABLE)}
+  WHERE document_id != 'baseline'
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY updated_at DESC, gcs_uri DESC) = 1`;
+
+app.get('/api/library', async (req, res) => {
+  if (!isGcpNativeConfigured()) return res.status(503).json({ error: 'Pustaka belum dikonfigurasikan.' });
+  const q = String(req.query.q || '').trim().slice(0, 200);
+  const source = String(req.query.source || '').slice(0, 200);
+  const page = Math.min(10000, Math.max(0, Number.parseInt(String(req.query.page || '0'), 10) || 0));
+  try {
+    const [rows, sources] = await Promise.all([
+      runBigQuery(`WITH corpus AS (${libraryCorpusSql()})
+        SELECT document_id, title, source_name, source_url, SUBSTR(content, 1, 240) AS excerpt
+        FROM corpus WHERE (@q = '' OR STRPOS(LOWER(title), LOWER(@q)) > 0 OR STRPOS(LOWER(content), LOWER(@q)) > 0)
+        AND (@source = '' OR source_name = @source)
+        ORDER BY updated_at DESC, document_id LIMIT 13 OFFSET @offset`, { q, source, offset: page * 12 }),
+      runBigQuery(`SELECT DISTINCT source_name FROM ${bqTableRef(BQ_CORPUS_TABLE)} WHERE source_name != '' AND document_id != 'baseline' ORDER BY source_name`)
+    ]);
+    res.json({ articles: rows.slice(0, 12), hasMore: rows.length > 12, sources: sources.map(row => row.source_name) });
+  } catch (error: any) {
+    console.error('Library read failed:', error.message);
+    res.status(503).json({ error: 'Pustaka tidak dapat dimuatkan. Sila cuba lagi.' });
+  }
+});
+
+app.get(['/api/library/:id', '/api/library/:id/download'], async (req, res) => {
+  if (!isGcpNativeConfigured()) return res.status(503).json({ error: 'Pustaka belum dikonfigurasikan.' });
+  try {
+    const rows = await runBigQuery(`SELECT document_id, title, source_url, source_name, content
+      FROM ${bqTableRef(BQ_CORPUS_TABLE)} WHERE document_id = @id AND document_id != 'baseline'
+      ORDER BY updated_at DESC, gcs_uri DESC LIMIT 1`, { id: req.params.id });
+    if (!rows.length) return res.status(404).json({ error: 'Artikel tidak ditemui.' });
+    const article = rows[0];
+    // Restrict navigable links, while retaining source text unchanged.
+    if (!/^https?:\/\//i.test(article.source_url || '')) article.source_url = '';
+    if (req.path.endsWith('/download')) {
+      res.attachment(`${String(article.document_id).replace(/[^a-zA-Z0-9_-]/g, '_')}.md`);
+      return res.type('text/markdown').send(article.content);
+    }
+    res.json({ article });
+  } catch (error: any) {
+    console.error('Article read failed:', error.message);
+    res.status(503).json({ error: 'Artikel tidak dapat dimuatkan. Sila cuba lagi.' });
+  }
+});
+
+app.get('/api/knowledge-status', async (_req, res) => {
+  try {
+    const active = await resolveGraphRelease();
+    res.json({ model: KNOWLEDGE_MODEL, configured: Boolean(GCP_PROJECT_ID && (process.env.KNOWLEDGE_PIPELINE_BUCKET || GCS_RAW_BUCKET)),
+      active: active ? { version: active.version, documents: active.documents, edges: active.edges, model: active.model, reviewStatus: active.reviewStatus } : null });
+  } catch (error: any) {
+    console.error('Knowledge status read failed:', error.message);
+    res.status(503).json({ error: 'Status tidak tersedia.' });
+  }
+});
+
 app.get("/api/get-graph", async (req, res) => {
   try {
-    const nativeGraph = await getFullGraphFromBigQuery();
+    const nativeGraph = await getFullGraphFromBigQuery(String(req.query.q || "").trim().slice(0, 200));
     if (nativeGraph) {
-      return res.json(nativeGraph);
+      return res.json({ ...nativeGraph, origin: "bigquery" });
     }
 
-    res.json({ nodes: fallbackNodes, links: fallbackLinks });
+    res.json({ nodes: fallbackNodes, links: fallbackLinks, origin: "fallback" });
   } catch (error: any) {
-    console.error("Get Graph Error:", error);
-    res.json({ nodes: fallbackNodes, links: fallbackLinks }); // Fail-safe
+    console.error("Get Graph Error:", error.message);
+    res.status(503).json({ error: "Graf tidak dapat dimuatkan." });
   }
 });
 
-// 3. Reset the graph state in BigQuery or local memory fallback.
-app.post("/api/reset-graph", async (req, res) => {
-  try {
-    const nativeGraph = await resetBigQueryGraph();
-    if (nativeGraph) {
-      fallbackNodes = JSON.parse(JSON.stringify(INITIAL_NODES));
-      fallbackLinks = JSON.parse(JSON.stringify(INITIAL_LINKS));
-      markKnowledgeChanged();
-      return res.json(nativeGraph);
-    }
-
-    fallbackNodes = JSON.parse(JSON.stringify(INITIAL_NODES));
-    fallbackLinks = JSON.parse(JSON.stringify(INITIAL_LINKS));
-    markKnowledgeChanged();
-    res.json({ nodes: fallbackNodes, links: fallbackLinks });
-  } catch (error: any) {
-    console.error("Reset Graph Error:", error);
-    res.status(500).json({ error: error.message || "An unexpected error occurred" });
-  }
-});
+// Retired: graph releases replace the old destructive reset path.
+app.post("/api/reset-graph", (_req, res) => res.status(410).json({ error: "Reset graf tidak tersedia." }));
 
 // ==========================================
 // REAL-TIME SCRAPING & BATCH INDEX PORTALS
 // ==========================================
-app.post("/api/ingest-url", async (req, res) => {
-  try {
-    const { url } = req.body;
-    if (!url) {
-      return res.status(400).json({ error: "URL diperlukan." });
-    }
-
-    const ai = getGeminiClient();
-
-    const stats = await ingestURLContent(url, ai, undefined, 1);
-    res.json({
-      success: true,
-      message: `Berjaya mengindeks "${stats.title}" melalui ${stats.crawler}.`,
-      stats
-    });
-  } catch (error: any) {
-    console.error("Ingest URL Error:", error);
-    res.status(500).json({ error: error.message || "Gagal melaksanakan proses crawler ke atas URL berkenaan." });
-  }
-});
+app.post("/api/ingest-url", (_req, res) => res.status(410).json({error:'Gunakan Kemas kini untuk sumber yang ditetapkan.'}));
 
 app.get("/api/crawl-sources", (req, res) => {
   res.json({
@@ -3667,69 +3644,8 @@ app.get("/api/crawl-logs", async (req, res) => {
   });
 });
 
-app.post("/api/ingest-batch", async (req, res) => {
-  if (isBatchCrawling) {
-    return res.status(400).json({ error: "Proses merangkak (batch crawling) sedang berjalan." });
-  }
-
-  let ai;
-  try {
-    ai = getGeminiClient();
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message });
-  }
-
-  isBatchCrawling = true;
-  batchCrawlLogs = [];
-  const batchRunId = randomUUID();
-
-  // Fire-and-forget background crawling
-  (async () => {
-    for (const source of SOURCE_PORTALS) {
-      const timeStr = getCrawlTimeString();
-      const maxPages = getSourceMaxPages(source);
-      const logEntry: CrawlLog = {
-        runId: batchRunId,
-        sourceId: source.id,
-        sourceName: source.name,
-        url: source.url,
-        title: "Penganalisisan Laman...",
-        status: "RUNNING",
-        log: `Memulakan Crawl4AI (${maxPages} halaman maks, kedalaman ${CRAWL_MAX_DEPTH}) untuk ${source.category}.`,
-        time: timeStr
-      };
-      batchCrawlLogs.push(logEntry);
-      await writeCrawlLogToBigQuery(logEntry, batchRunId);
-
-      try {
-        console.log(`Crawler: Ingesting source: ${source.name} (${source.url})`);
-        const stats = await ingestURLContent(source.url, ai, source, undefined, batchRunId);
-        
-        logEntry.title = stats.title;
-        logEntry.status = "SUCCESS";
-        logEntry.pagesCount = stats.documentsCount;
-        logEntry.chunksCount = stats.chunksCount;
-        logEntry.nodesCount = stats.nodesCount;
-	        logEntry.linksCount = stats.linksCount;
-	        logEntry.crawler = stats.crawler;
-	        logEntry.gcsStatus = stats.gcsStatus;
-	        logEntry.bigQueryStatus = stats.bigQueryStatus;
-	        logEntry.knowledgeCatalogStatus = stats.knowledgeCatalogStatus;
-	        logEntry.log = `Mengindeks ${stats.updatedDocumentsCount || 0}/${stats.documentsCount} dokumen baharu/berubah, melangkau ${stats.skippedDocumentsCount || 0} dokumen tidak berubah, ${stats.chunksCount} chunks, ${stats.nodesCount} nod + ${stats.linksCount} hubungan, GCS: ${stats.gcsStatus}, Knowledge Catalog: ${stats.knowledgeCatalogStatus}.`;
-      } catch (err: any) {
-        console.error(`Crawler Error for ${source.url}:`, err.message);
-        logEntry.status = "FAILED";
-        logEntry.log = `Gagal diindeks: ${err.message}`;
-      }
-
-      logEntry.time = getCrawlTimeString();
-      await writeCrawlLogToBigQuery(logEntry, batchRunId);
-    }
-    isBatchCrawling = false;
-  })();
-
-	  res.json({ success: true, message: "Proses crawler Crawl4AI + BigQuery/Knowledge Catalog diaktifkan di latar belakang.", total: SOURCE_PORTALS.length });
-});
+// All updates now use the resumable Cloud Run pipeline.
+app.post("/api/ingest-batch", (_req, res) => res.redirect(307, '/api/knowledge/update'));
 
 // Setup Vite Dev server or Serve build files
 async function startServer() {

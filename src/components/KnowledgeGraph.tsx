@@ -1,14 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "./Button";
 import * as d3 from "d3";
 import { KnowledgeNode, KnowledgeLink } from "../types";
-import { Maximize2, Minimize2, ZoomIn, ZoomOut, RefreshCw, RotateCcw } from "lucide-react";
+import { Maximize2, Minimize2, ZoomIn, ZoomOut, RefreshCw } from "lucide-react";
 
 interface KnowledgeGraphProps {
   nodes: KnowledgeNode[];
   links: KnowledgeLink[];
   onNodeSelect?: (node: KnowledgeNode) => void;
   selectedNodeId?: string | null;
-  onResetGraph?: () => void;
 }
 
 type GraphNodeDatum = KnowledgeNode & d3.SimulationNodeDatum;
@@ -83,7 +83,6 @@ export function KnowledgeGraph({
   links,
   onNodeSelect,
   selectedNodeId,
-  onResetGraph,
 }: KnowledgeGraphProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
@@ -125,7 +124,8 @@ export function KnowledgeGraph({
   }, []);
 
   useEffect(() => {
-    if (!svgRef.current || !nodes.length) return;
+    if (!svgRef.current) return;
+    if (!nodes.length) { d3.select(svgRef.current).selectAll("*").remove(); return; }
 
     const { width, height } = dimensions;
     const svg = d3.select(svgRef.current);
@@ -560,7 +560,7 @@ export function KnowledgeGraph({
 
       <div className="absolute inset-0 islamic-grid pointer-events-none opacity-40" />
 
-      <div className="absolute top-4 left-4 z-10 flex flex-wrap gap-2 max-w-[85%] pointer-events-none">
+      <div className="absolute bottom-16 left-4 z-10 flex flex-wrap gap-2 max-w-[90%] pointer-events-none">
         {["Konsep", "Hukum", "Sumber", "Mazhab", "Institusi", "Artikkel"].map((type) => (
           <span
             key={type}
@@ -576,43 +576,34 @@ export function KnowledgeGraph({
       </div>
 
       <div className="absolute top-4 right-4 z-10 flex items-center gap-1 rounded-full bg-white/90 p-1 shadow-sm ring-1 ring-[#E5E1D8] backdrop-blur-md pointer-events-auto">
-        {onResetGraph && (
-          <button
-            onClick={onResetGraph}
-            className="p-2 rounded-full text-[#0F766E] hover:bg-[#E5F2EE] active:scale-95 transition-transform cursor-pointer"
-            title="Reset Graf"
-          >
-            <RotateCcw className="w-4 h-4" />
-          </button>
-        )}
-        <button
+        <Button variant="ghost"
           onClick={() => handleZoom(1.2)}
           className="p-2 rounded-full text-[#5A634A] hover:bg-[#EAE7DF] active:scale-95 transition-transform cursor-pointer"
           title="Zoom Masuk"
         >
           <ZoomIn className="w-4 h-4" />
-        </button>
-        <button
+        </Button>
+        <Button variant="ghost"
           onClick={() => handleZoom(0.8)}
           className="p-2 rounded-full text-[#5A634A] hover:bg-[#EAE7DF] active:scale-95 transition-transform cursor-pointer"
           title="Zoom Keluar"
         >
           <ZoomOut className="w-4 h-4" />
-        </button>
-        <button
+        </Button>
+        <Button variant="ghost"
           onClick={() => handleZoom(1)}
           className="p-2 rounded-full text-[#5A634A] hover:bg-[#EAE7DF] active:scale-95 transition-transform cursor-pointer"
-          title="Muatkan Semua Nod"
+          title="Lihat semua" aria-label="Lihat semua"
         >
           <RefreshCw className="w-4 h-4" />
-        </button>
-        <button
+        </Button>
+        <Button variant="ghost"
           onClick={() => setIsFullscreen(!isFullscreen)}
           className="p-2 rounded-full text-[#5A634A] hover:bg-[#EAE7DF] active:scale-95 transition-transform cursor-pointer"
           title={isFullscreen ? "Keluar Skrin Penuh" : "Skrin Penuh"}
         >
           {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
-        </button>
+        </Button>
       </div>
 
       <svg

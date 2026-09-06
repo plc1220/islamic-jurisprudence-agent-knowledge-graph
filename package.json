@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs && esbuild scripts/backfill.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/backfill.cjs",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs && esbuild scripts/backfill.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/backfill.cjs && esbuild scripts/rebuild-graph.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/rebuild-graph.cjs && esbuild scripts/update-knowledge.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/update-knowledge.cjs",
     "start": "node dist/server.cjs",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "graph:pipeline": "tsx scripts/rebuild-graph.ts",
+    "test:graph": "tsx --test tests/knowledge-pipeline.test.ts",
+    "knowledge:worker": "tsx scripts/update-knowledge.ts"
   },
   "dependencies": {
     "@google-cloud/bigquery": "^8.3.1",

@@ -408,3 +408,26 @@ resource "google_cloud_run_service_iam_member" "noauth" {
   role     = "roles/run.invoker"
   member   = "allUsers"
 }
+
+# Read-only job progress access. Execution permission is bound to the update job
+# by the deploy workflow, not granted project-wide.
+resource "google_project_iam_custom_role" "knowledge_job_status" {
+  role_id     = "mursyidKnowledgeJobStatus"
+  title       = "Mursyid knowledge job status"
+  permissions = ["run.operations.get", "run.executions.get", "run.executions.list"]
+  depends_on  = [google_project_service.apis]
+}
+
+resource "google_project_iam_member" "knowledge_job_status" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.knowledge_job_status.name
+  member  = "serviceAccount:${google_service_account.cloud_run_runtime.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "knowledge_admin_reader" {
+  count     = var.knowledge_admin_secret != "" ? 1 : 0
+  project   = var.project_id
+  secret_id = var.knowledge_admin_secret
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.cloud_run_runtime.email}"
+}

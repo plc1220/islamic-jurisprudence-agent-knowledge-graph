@@ -1,4 +1,4 @@
-export type AppTab = "chat" | "graph" | "sources" | "analytics" | "review";
+export type AppTab = "chat" | "graph" | "sources" | "analytics" | "review" | "curation" | "ingest";
 
 export type FeedbackRating = "up" | "down";
 export type FeedbackReviewStatus = "new" | "reviewing" | "resolved";
@@ -28,6 +28,7 @@ export interface KnowledgeNode {
   type: "Konsep" | "Hukum" | "Sumber" | "Mazhab" | "Institusi" | "Artikkel" | "Entity";
   label: string;
   description: string;
+  evidence?: { documentId: string; title: string; url: string; quote: string; statement: string; conditions: string; school: string; authority: string }[];
   // properties added for D3 force layout
   x?: number;
   y?: number;

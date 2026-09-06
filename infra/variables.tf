@@ -194,3 +194,9 @@ variable "github_repository" {
   type        = string
   default     = "plc1220/islamic-jurisprudence-agent-knowledge-graph"
 }
+
+variable "knowledge_admin_secret" {
+  description = "Existing Secret Manager secret name for the knowledge admin token; blank leaves app updates disabled."
+  type        = string
+  default     = ""
+}

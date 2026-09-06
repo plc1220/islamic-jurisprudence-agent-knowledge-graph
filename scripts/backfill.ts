@@ -1,4 +1,6 @@
 import dotenv from "dotenv";
+import { CloudStore, PREFIX } from "./knowledge/cloud";
+import { reuseOrCrawl } from "./knowledge/crawl-cache";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -176,7 +178,7 @@ const BQ_GRAPH_TABLE = process.env.BQ_GRAPH_TABLE || "graph_edges";
 const BQ_CRAWL_RUNS_TABLE = process.env.BQ_CRAWL_RUNS_TABLE || "crawl_runs";
 const BQ_CRAWL_ATTEMPTS_TABLE = process.env.BQ_CRAWL_ATTEMPTS_TABLE || "crawl_attempts";
 const BQ_EMBEDDING_MODEL = process.env.BQ_EMBEDDING_MODEL || "text-embedding-004";
-const EXTRACTOR_MODEL = process.env.EXTRACTOR_MODEL || "gemini-3.5-flash";
+const EXTRACTOR_MODEL = process.env.EXTRACTOR_MODEL || "gemini-3.7-flash";
 const CRAWLER_MODEL = process.env.CRAWLER_MODEL || "gemini-3.1-flash-lite";
 const PYTHON_BIN = process.env.PYTHON_BIN || "python3";
 const CRAWL4AI_BRIDGE_PATH = process.env.CRAWL4AI_BRIDGE_PATH || path.join(process.cwd(), "scripts", "crawl4ai_bridge.py");
@@ -190,6 +192,8 @@ const BACKFILL_MAX_CONCURRENCY = Math.max(1, parseInt(process.env.BACKFILL_MAX_C
 const BACKFILL_DISCOVERY_DEPTH = Math.max(1, parseInt(process.env.BACKFILL_DISCOVERY_DEPTH || "2", 10));
 const BACKFILL_KEEP_STAGE = process.env.BACKFILL_KEEP_STAGE === "true";
 const BACKFILL_DRY_RUN = process.env.BACKFILL_DRY_RUN === "true";
+const BACKFILL_EXTRACT_GRAPH = process.env.BACKFILL_EXTRACT_GRAPH !== "false";
+const BACKFILL_REFRESH_EXISTING = process.env.BACKFILL_REFRESH_EXISTING === "true";
 const BACKFILL_PUBLISH_CATALOG = process.env.BACKFILL_PUBLISH_CATALOG !== "false";
 const BACKFILL_RUN_ID = process.env.BACKFILL_RESUME_RUN_ID || randomUUID();
 const LOAD_ROWS_PER_SHARD = Math.max(1, parseInt(process.env.BACKFILL_LOAD_ROWS_PER_SHARD || "5000", 10));
@@ -200,6 +204,8 @@ const DISCOVERY_MAX_SITEMAPS_PER_SOURCE = Math.max(5, parseInt(process.env.DISCO
 
 const bigQuery = new BigQuery({ projectId: GCP_PROJECT_ID });
 const storage = new Storage({ projectId: GCP_PROJECT_ID });
+const crawlCache = new CloudStore(storage, GCS_RAW_BUCKET, `${PREFIX}/crawl-cache`);
+const embeddingCache = new CloudStore(storage, GCS_RAW_BUCKET, `${PREFIX}/embedding-cache`);
 let googleAuth: GoogleAuth | null = null;
 let knowledgeCatalogScaffoldPromise: Promise<void> | null = null;
 
@@ -414,18 +420,14 @@ async function ensureBigQueryStore(): Promise<void> {
 }
 
 async function getExistingDocumentMap(): Promise<Map<string, ExistingDocumentRecord>> {
-  const rows = await runBigQuery(`
-    SELECT document_id, ANY_VALUE(content_hash) AS content_hash
-    FROM ${bqTableRef(BQ_CORPUS_TABLE)}
-    GROUP BY document_id
-  `);
-  return new Map(rows.map(row => [
-    row.document_id,
-    {
-      documentId: row.document_id,
-      contentHash: row.content_hash || "",
-    },
-  ]));
+  const rows = await runBigQuery(`SELECT document_id, source_url, content_hash FROM ${bqTableRef(BQ_CORPUS_TABLE)} ORDER BY updated_at ASC`);
+  const result = new Map<string, ExistingDocumentRecord>();
+  for (const row of rows) {
+    const record = { documentId: row.document_id, contentHash: row.content_hash || "" };
+    result.set(row.document_id, record);
+    if (row.source_url) result.set(documentIdForUrl(row.source_url), record);
+  }
+  return result;
 }
 
 function wildcardToRegExp(pattern: string): RegExp {
@@ -504,7 +506,7 @@ async function discoverSitemapUrls(sitemapUrl: string, source: CrawlSource, seen
   }
 }
 
-async function discoverHtmlBfs(source: CrawlSource): Promise<string[]> {
+async function discoverHtmlBfs(source: CrawlSource, existingDocuments: Map<string, ExistingDocumentRecord>): Promise<string[]> {
   const queue: { url: string; depth: number }[] = [{ url: normalizeDocumentUrl(source.url), depth: 0 }];
   const seen = new Set<string>();
   const candidates = new Set<string>();
@@ -517,6 +519,8 @@ async function discoverHtmlBfs(source: CrawlSource): Promise<string[]> {
       break;
     }
     seen.add(current.url);
+    // Feed/index discovery is still read; already indexed detail pages are not fetched.
+    if (current.depth > 0 && existingDocuments.has(documentIdForUrl(current.url)) && !/[?&](start|page|offset)=/i.test(current.url)) continue;
 
     let html = "";
     try {
@@ -540,7 +544,7 @@ async function discoverHtmlBfs(source: CrawlSource): Promise<string[]> {
   return Array.from(candidates);
 }
 
-async function discoverSourceUrls(source: CrawlSource): Promise<CandidateUrl[]> {
+async function discoverSourceUrls(source: CrawlSource, existingDocuments: Map<string, ExistingDocumentRecord>): Promise<CandidateUrl[]> {
   const discovered = new Set<string>();
   const sitemapSeeds = [
     `${new URL(source.url).origin}/sitemap.xml`,
@@ -580,7 +584,7 @@ async function discoverSourceUrls(source: CrawlSource): Promise<CandidateUrl[]> 
     }
   }
 
-  for (const url of await discoverHtmlBfs(source)) {
+  for (const url of await discoverHtmlBfs(source, existingDocuments)) {
     discovered.add(url);
   }
 
@@ -744,11 +748,16 @@ function getEmbeddingModelName(): string {
 }
 
 async function generateTextEmbedding(ai: GoogleGenAI, content: string): Promise<number[]> {
+  const cacheKey = `${hashId(`${getEmbeddingModelName()}:${content}`, 64)}.json`;
+  const cached = await embeddingCache.read<number[]>(cacheKey);
+  if (cached) return cached;
   const embedResponse = await ai.models.embedContent({
     model: getEmbeddingModelName(),
     contents: content,
   });
-  return embedResponse.embeddings?.[0]?.values || [];
+  const values = embedResponse.embeddings?.[0]?.values;
+  if (!values?.length) throw new Error("Embedding response is empty");
+  return embeddingCache.once(cacheKey, values);
 }
 
 async function extractGraph(ai: GoogleGenAI, document: CrawledDocument): Promise<GraphExtraction> {
@@ -1261,6 +1270,7 @@ async function mergeStagingTables(tables: Record<string, string>): Promise<void>
           AND staged.content_hash = target.content_hash
       );
 
+    ${BACKFILL_EXTRACT_GRAPH ? `
     MERGE ${bqTableRef(BQ_GRAPH_TABLE)} AS target
     USING (
       SELECT * FROM ${bqTableRef(tables.graph)}
@@ -1305,6 +1315,8 @@ async function mergeStagingTables(tables: Record<string, string>): Promise<void>
           AND staged.content_hash = target.content_hash
       );
 
+` : ''}
+
     INSERT INTO ${bqTableRef(BQ_CRAWL_ATTEMPTS_TABLE)}
     SELECT * FROM ${bqTableRef(tables.attempts)};
 
@@ -1347,7 +1359,12 @@ async function processCandidate(
   }
 ): Promise<void> {
   try {
-    const documents = await crawlUrl(source, candidate.url, ai);
+    const fetched = await reuseOrCrawl(normalizeDocumentUrl(candidate.url), existingDocuments.has(documentIdForUrl(candidate.url)), BACKFILL_REFRESH_EXISTING, crawlCache, () => crawlUrl(source, candidate.url, ai));
+    if (fetched.status === 'known') {
+      await writers.attempts.append(attemptRow(source, candidate.url, 'SKIPPED_KNOWN'));
+      return;
+    }
+    const documents = fetched.documents;
     if (documents.length === 0) {
       await writers.attempts.append(attemptRow(source, candidate.url, "FAILED", { error: "No crawlable document returned" }));
       return;
@@ -1374,11 +1391,11 @@ async function processCandidate(
           embeddings.push(await generateTextEmbedding(ai, chunk));
         } catch (err: any) {
           console.warn(`Embedding warning for ${document.url}: ${err.message}`);
-          embeddings.push([]);
+          throw err;
         }
       }
       const preparedChunks = prepareChunks(document, documentId, contentHash, BACKFILL_RUN_ID, embeddings);
-      const graphData = await extractGraph(ai, document);
+      const graphData = BACKFILL_EXTRACT_GRAPH ? await extractGraph(ai, document) : { nodes: [], links: [] };
       const catalogStatus = await publishToKnowledgeCatalog(document, documentId, graphData, gcsUri).catch((err: any) => {
         console.warn(`Catalog warning for ${document.url}: ${err.message}`);
         return "FAILED";
@@ -1421,7 +1438,7 @@ async function main(): Promise<void> {
   const allCandidates: CandidateUrl[] = [];
   for (const source of sources) {
     console.log(`Discovering URLs for ${source.name} (${source.url}).`);
-    const candidates = await discoverSourceUrls(source);
+    const candidates = await discoverSourceUrls(source, existingDocuments);
     candidatesBySource.set(source.id, candidates);
     allCandidates.push(...candidates);
     console.log(`Discovered ${candidates.length} URL(s) for ${source.name}.`);
@@ -1464,6 +1481,8 @@ async function main(): Promise<void> {
   await loadJsonlIntoTable(stagingTables.graph, writers.graph.uris);
   await loadJsonlIntoTable(stagingTables.attempts, writers.attempts.uris);
   await mergeStagingTables(stagingTables);
+  const [attemptCounts] = await runBigQuery(`SELECT COUNTIF(status = 'FAILED') AS failed FROM ${bqTableRef(stagingTables.attempts)}`);
+  if (Number(attemptCounts?.failed || 0) > 0 && !BACKFILL_EXTRACT_GRAPH) throw new Error(`${attemptCounts.failed} new URLs failed; successful sources are saved for the next update.`);
 
   await runBigQuery(`
     INSERT INTO ${bqTableRef(BQ_CRAWL_RUNS_TABLE)} (

@@ -6,12 +6,8 @@ import {
   BookOpen,
   Compass,
   Send,
-  HelpCircle,
   AlertTriangle,
   ExternalLink,
-  Lock,
-  Globe,
-  BarChart3,
   ClipboardCheck,
   ThumbsUp,
   ThumbsDown,
@@ -29,9 +25,11 @@ import {
   KnowledgeLink,
   PersistedAppState,
 } from "./types";
-import { OFFICIAL_SOURCES, PRESET_QUESTIONS, INITIAL_NODES, INITIAL_LINKS } from "./data";
+import { PRESET_QUESTIONS, INITIAL_NODES, INITIAL_LINKS } from "./data";
 import { KnowledgeGraph } from "./components/KnowledgeGraph";
-import { SourceCard } from "./components/SourceCard";
+import { Library } from "./components/Library";
+import { Button } from "./components/Button";
+import { CurationPlan } from "./components/CurationPlan";
 import { CrawlerPanel } from "./components/CrawlerPanel";
 import { ChatMarkdownRenderer } from "./components/ChatMarkdownRenderer";
 import { RelevantGraphSnippet } from "./components/RelevantGraphSnippet";
@@ -39,7 +37,7 @@ import { RelevantGraphSnippet } from "./components/RelevantGraphSnippet";
 const createWelcomeMessage = (): ChatMessage => ({
   id: "welcome",
   role: "model",
-  content: "Assalamualaikum rukun ilmuwan. Saya adalah Ejen Pakar Syariah Islam berpandukan Mazhab Syafi'i dan rujukan berautoriti Malaysia (seperti JAKIM & Jabatan Mufti WP). Sila tanyakan kemusykilan hukum fiqh, hadis, fatwa semasa, atau soalan sejarah Islam anda di bawah.",
+  content: "Assalamualaikum. Apa yang ingin anda fahami hari ini? Terokai persoalan fiqh, hadis dan fatwa bersama rujukan sumbernya.",
   timestamp: new Date(),
 });
 
@@ -60,7 +58,9 @@ function reviveChatMessages(messages: any): ChatMessage[] {
 export default function App() {
   // Navigation State
   const [activeTab, setActiveTab] = useState<AppTab>("chat");
-  const [graphSubTab, setGraphSubTab] = useState<"visualize" | "ingest">("visualize");
+  const graphSubTab = "visualize" as const;
+  const [graphStatus, setGraphStatus] = useState("Memuatkan graf…");
+  const [graphSearch, setGraphSearch] = useState("");
   const [isAgentInfoOpen, setIsAgentInfoOpen] = useState(false);
   const [isSessionHydrated, setIsSessionHydrated] = useState(false);
   const [pendingSelectedNodeId, setPendingSelectedNodeId] = useState<string | null>(null);
@@ -161,7 +161,7 @@ export default function App() {
       setSuccessNotice(
         payload.rating === "up"
           ? "Terima kasih. Jawapan ini ditanda membantu."
-          : "Maklum balas dihantar ke Review Bench untuk semakan."
+          : "Maklum balas dihantar ke Semakan Maklum Balas untuk semakan."
       );
     } catch (err: any) {
       setGlobalError(err.message || "Gagal menyimpan maklum balas.");
@@ -193,10 +193,10 @@ export default function App() {
         body: JSON.stringify(patch),
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Gagal mengemas kini Review Bench.");
+      if (!response.ok) throw new Error(data.error || "Gagal mengemas kini Semakan Maklum Balas.");
       await refreshFeedback();
     } catch (err: any) {
-      setGlobalError(err.message || "Gagal mengemas kini Review Bench.");
+      setGlobalError(err.message || "Gagal mengemas kini Semakan Maklum Balas.");
     }
   };
 
@@ -229,11 +229,11 @@ export default function App() {
           state.activeTab === "graph" ||
           state.activeTab === "sources" ||
           state.activeTab === "analytics" ||
-          state.activeTab === "review"
+          state.activeTab === "review" || state.activeTab === "curation" || state.activeTab === "ingest"
         ) {
           setActiveTab(state.activeTab);
         }
-        if (state.graphSubTab) setGraphSubTab(state.graphSubTab);
+
         if (typeof state.isAgentInfoOpen === "boolean") setIsAgentInfoOpen(state.isAgentInfoOpen);
         if (typeof state.userInput === "string") setUserInput(state.userInput);
 
@@ -453,11 +453,13 @@ export default function App() {
   };
 
   // Reusable graph refresh function
-  const refreshGraph = async () => {
+  const refreshGraph = async (query = "") => {
     try {
-      const response = await fetch("/api/get-graph");
+      const response = await fetch(`/api/get-graph?q=${encodeURIComponent(query)}`);
       const data = await response.json();
+      if (!response.ok || !Array.isArray(data.nodes) || !Array.isArray(data.links)) throw new Error("Graf tidak tersedia.");
       if (response.ok && data.nodes && data.links) {
+        setGraphStatus(data.origin === "bigquery" ? `Graf tersimpan · belum disemak${data.truncated ? " · sebahagian graf" : ""}` : "Graf contoh · data tidak tersedia");
         setNodes(data.nodes);
         setLinks(data.links);
         setSelectedNode((current) => {
@@ -467,6 +469,7 @@ export default function App() {
         });
       }
     } catch (err) {
+      setGraphStatus("Graf tidak dapat dimuatkan. Cuba muat semula.");
       console.error("Gagal mendapatkan graf daripada pelayan:", err);
     }
   };
@@ -475,37 +478,6 @@ export default function App() {
   useEffect(() => {
     refreshGraph();
   }, []);
-
-  // Reset the Knowledge Graph back to pristine original Shafi'i ontology
-  const handleResetGraph = async () => {
-    try {
-      const response = await fetch("/api/reset-graph", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" }
-      });
-      const data = await response.json();
-      if (response.ok && data.nodes && data.links) {
-        setNodes(data.nodes);
-        setLinks(data.links);
-        setPendingSelectedNodeId(null);
-        if (data.nodes.length > 0) {
-          setSelectedNode(data.nodes[0]);
-        }
-      } else {
-        setPendingSelectedNodeId(null);
-        setNodes(INITIAL_NODES);
-        setLinks(INITIAL_LINKS);
-        setSelectedNode(INITIAL_NODES[0]);
-      }
-    } catch (err) {
-      console.error("Gagal menetapkan semula graf di pelayan, menetapkan semula secara lokal:", err);
-      setPendingSelectedNodeId(null);
-      setNodes(INITIAL_NODES);
-      setLinks(INITIAL_LINKS);
-      setSelectedNode(INITIAL_NODES[0]);
-    }
-    setSuccessNotice("Berjaya mengembalikan sistem ontologi fekah kepada struktur asas Mazhab Syafi'i.");
-  };
 
   const [successNotice, setSuccessNotice] = useState<string | null>(null);
   useEffect(() => {
@@ -516,112 +488,18 @@ export default function App() {
   }, [successNotice]);
 
   return (
-    <div className="min-h-screen bg-[#FDFBF7] text-[#3D3B36] font-sans islamic-grid antialiased selection:bg-[#5A634A]/20 flex flex-col">
+    <div className="app-shell min-h-screen font-sans antialiased flex flex-col">
       
-      {/* Visual top border line */}
-      <div className="h-1 bg-gradient-to-r from-[#5A634A] via-[#8B9474] to-[#A48F68]" />
-
-      {/* Header section (strictly literal and compliant, no telemetry bloat) */}
-      <header className="border-b border-[#E5E1D8] bg-[#F9F7F2]/95 backdrop-blur sticky top-0 z-40">
-        <div className="max-w-7xl mx-auto px-4 py-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-[#5A634A] flex items-center justify-center shadow-md shadow-[#5A634A]/10 ring-1 ring-[#5A634A]/10">
-              <Compass className="w-5 h-5 text-[#FDFBF7] animate-pulse" />
-            </div>
-            <div className="text-left">
-              <h1 className="font-serif text-xl font-bold text-[#2D2B26]">
-                Mursyid AI <span className="text-sm font-sans font-normal text-[#8A8478] ml-2 italic">| Gerbang Ilmu Syariah</span>
-              </h1>
-              <p className="text-[10px] uppercase font-sans tracking-widest text-[#8A8478]">
-                Hubungan Ontologi & Carian Terbimbing Berautoriti • Bahasa Melayu
-              </p>
-            </div>
-          </div>
-
-          {/* Quick source link counts to make header intuitive */}
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-[10px] font-sans font-semibold text-[#6D685E] bg-[#EAE7DF] border border-[#D4D0C6] px-3 py-1 rounded-full">
-              MAZHAB UTAMA: <span className="text-[#5A634A] font-bold">SYAFI'I</span>
-            </span>
-            <span className="text-[10px] font-sans font-semibold text-[#6D685E] bg-[#EAE7DF] border border-[#D4D0C6] px-3 py-1 rounded-full">
-              SUMBER BERSEPADU: <span className="text-[#A48F68] font-bold">10 PORTAL RASMI</span>
-            </span>
-            <div className="flex items-center gap-1.5 bg-[#EAE7DF]/60 border border-[#D4D0C6] px-3 py-1 rounded-full shadow-inner">
-              <Lock className="w-3 h-3 text-[#5A634A]" />
-              <span className="text-[10px] font-sans font-semibold text-[#6D685E]">
-                GEMINI: <span className="text-[#5A634A] font-bold">ADC</span>
-              </span>
-            </div>
-          </div>
-        </div>
-      </header>
+      <header className="app-header"><div className="app-header-inner"><div className="brand"><span className="brand-icon"><Compass /></span><div><h1 aria-label="Mursyid AI">Mursyid<span>AI</span></h1><p>Ruang ilmu Syariah</p></div></div><span className="brand-note">Berpandukan sumber. Memahami konteks.</span></div></header>
 
       {/* Main Content Stage */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 py-6 sm:px-6 lg:px-8 flex flex-col gap-6">
         
-        {/* Navigation Tabs bar */}
-        <div className="flex flex-wrap p-1 rounded-xl bg-[#F9F7F2] border border-[#E5E1D8] gap-1 shadow-sm">
-          <button
-            onClick={() => setActiveTab("chat")}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold tracking-wide transition-all cursor-pointer ${
-              activeTab === "chat"
-                ? "bg-[#5A634A] text-white shadow-sm"
-                : "text-[#5A564E] hover:text-[#5A634A] hover:bg-[#EAE7DF]/50"
-            }`}
-          >
-            <MessageSquare className="w-4 h-4 shrink-0" />
-            Ejen Halaqah Syariah (Sembang)
-          </button>
-          
-          <button
-            onClick={() => setActiveTab("graph")}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold tracking-wide transition-all cursor-pointer ${
-              activeTab === "graph"
-                ? "bg-[#5A634A] text-white shadow-sm"
-                : "text-[#5A564E] hover:text-[#5A634A] hover:bg-[#EAE7DF]/50"
-            }`}
-          >
-            <Network className="w-4 h-4 shrink-0" />
-            Graf Pengetahuan & Pembina Ontologi (D3)
-          </button>
-          
-          <button
-            onClick={() => setActiveTab("sources")}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold tracking-wide transition-all cursor-pointer ${
-              activeTab === "sources"
-                ? "bg-[#5A634A] text-white shadow-sm"
-                : "text-[#5A564E] hover:text-[#5A634A] hover:bg-[#EAE7DF]/50"
-            }`}
-          >
-            <BookOpen className="w-4 h-4 shrink-0" />
-            Saranan & Katalog Dokumen Sahih
-          </button>
-
-          <button
-            onClick={() => setActiveTab("analytics")}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold tracking-wide transition-all cursor-pointer ${
-              activeTab === "analytics"
-                ? "bg-[#5A634A] text-white shadow-sm"
-                : "text-[#5A564E] hover:text-[#5A634A] hover:bg-[#EAE7DF]/50"
-            }`}
-          >
-            <BarChart3 className="w-4 h-4 shrink-0" />
-            Analytic
-          </button>
-
-          <button
-            onClick={() => setActiveTab("review")}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold tracking-wide transition-all cursor-pointer ${
-              activeTab === "review"
-                ? "bg-[#5A634A] text-white shadow-sm"
-                : "text-[#5A564E] hover:text-[#5A634A] hover:bg-[#EAE7DF]/50"
-            }`}
-          >
-            <ClipboardCheck className="w-4 h-4 shrink-0" />
-            Review Bench
-          </button>
-
-        </div>
+        <nav className="main-navigation" aria-label="Navigasi utama">
+          {([{ id: 'chat', label: 'Sembang', icon: MessageSquare }, { id: 'sources', label: 'Pustaka', icon: BookOpen }, { id: 'graph', label: 'Teroka', icon: Network }] as const).map(({id, label, icon: Icon}) => <Button key={id} variant="ghost" aria-current={activeTab === id ? 'page' : undefined} className={activeTab === id ? 'nav-active' : ''} onClick={() => setActiveTab(id)}><Icon />{label}</Button>)}
+          <Button variant="ghost" className={`admin-navigation ${['curation','review','analytics','ingest'].includes(activeTab) ? 'nav-active' : ''}`} aria-current={['curation','review','analytics','ingest'].includes(activeTab) ? 'page' : undefined} onClick={() => setActiveTab('curation')}><ClipboardCheck />Urus</Button>
+        </nav>
+        {['curation','review','analytics','ingest'].includes(activeTab) && <nav className="admin-tabs" aria-label="Pentadbiran">{([{id:'curation', label:'Ilmu'},{id:'review',label:'Semakan'},{id:'analytics',label:'Analitik'},{id:'ingest',label:'Sumber'}] as const).map(({id,label}) => <Button key={id} variant="ghost" aria-current={activeTab === id ? 'page' : undefined} className={activeTab === id ? 'nav-active' : ''} onClick={() => setActiveTab(id)}>{label}</Button>)}</nav>}
 
         {/* Global warning if ADC / Vertex AI is not configured */}
         {chatError?.includes("ADC") && (
@@ -650,17 +528,17 @@ export default function App() {
               <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
               <span>{globalError}</span>
             </div>
-            <button 
+            <Button
               onClick={() => setGlobalError(null)} 
               className="text-[10px] text-rose-400 hover:text-rose-200 cursor-pointer font-semibold underline px-1 shrink-0"
             >
               Tutup
-            </button>
+            </Button>
           </div>
         )}
 
         {/* Dynamic Tab Panel Stage with motion animations (compliant with framework rules) */}
-        <div className="flex-1 bg-white rounded-2xl border border-[#E5E1D8] min-h-[500px] p-4 sm:p-6 overflow-hidden relative shadow-sm">
+        <div className="workspace-panel flex-1 min-w-0 min-h-[500px] relative">
           
           <>
             
@@ -672,73 +550,35 @@ export default function App() {
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -10 }}
                 transition={{ duration: 0.2 }}
-                className="grid grid-cols-1 lg:grid-cols-4 gap-6 h-full"
+                className="chat-layout"
               >
                 {/* Side presets & resource instructions */}
-                <div className="lg:col-span-1 space-y-4 text-left">
-                  <div className="rounded-lg bg-[#F7F4ED] px-3 py-2 shadow-sm ring-1 ring-[#E5E1D8]">
-                    <button
-                      type="button"
-                      onClick={() => setIsAgentInfoOpen((open) => !open)}
-                      className="flex w-full items-center justify-between gap-3 text-left text-xs font-semibold text-[#4D5F49] cursor-pointer"
-                      aria-expanded={isAgentInfoOpen}
-                    >
-                      <span className="flex items-center gap-2">
-                        <HelpCircle className="w-4 h-4 text-[#0F766E]" />
-                        Arahan Ejen Fiqh
-                      </span>
-                      <span className="text-[11px] text-[#8A8478]">
-                        {isAgentInfoOpen ? "Tutup" : "Info"}
-                      </span>
-                    </button>
-
-                    {isAgentInfoOpen && (
-                      <div className="mt-3 space-y-3 border-t border-[#E5E1D8] pt-3">
-                        <p className="text-[12px] text-[#5A564E] leading-relaxed">
-                          Kecerdasan Buatan menggunakan model <strong>Gemini 3.1-Flash-Lite</strong> bersepadu dengan
-                          <strong> Google Search Grounding</strong>. Jawapan dipautkan kepada 10 domain rujukan rasmi.
-                        </p>
-                        <div className="flex flex-wrap gap-1.5">
-                          <span className="text-[11px] text-[#3D3B36] bg-white px-2 py-1 rounded-full ring-1 ring-[#E5E1D8]">
-                            Imam Al-Shafi'i
-                          </span>
-                          <span className="text-[11px] text-[#3D3B36] bg-white px-2 py-1 rounded-full ring-1 ring-[#E5E1D8]">
-                            Adab Melayu
-                          </span>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
+                {chatMessages.length <= 1 && <div className="chat-suggestions space-y-4 text-left">
                   {/* Preset Questions selection */}
                   <div className="space-y-2">
                     <span className="text-[12px] font-semibold text-[#4F4A43] block">
-                      Cadangan Persoalan Hukum
+                      Cuba tanya
                     </span>
                     <div className="flex flex-col gap-2">
                       {PRESET_QUESTIONS.map((pq, idx) => (
-                        <button
+                        <Button
                           key={idx}
                           onClick={() => handleSendMessage(pq.question)}
                           disabled={isChatLoading}
                           className="group rounded-2xl bg-[#F7F4ED] px-3 py-2.5 text-left text-xs text-[#3D3B36] shadow-sm ring-1 ring-[#E5E1D8] transition-colors hover:bg-white hover:ring-[#0F766E]/45 disabled:cursor-not-allowed disabled:opacity-60 cursor-pointer"
                         >
-                          <div className="mb-1.5 flex items-center gap-2">
-                            <span className="rounded-full bg-[#E5F2EE] px-2 py-0.5 text-[10px] font-semibold text-[#0F766E]">
-                              {pq.category}
-                            </span>
-                          </div>
                           <p className="line-clamp-2 text-[12px] leading-relaxed text-[#5A564E] group-hover:text-[#2D2B26]">
-                            {pq.question}
+                            {pq.shortLabel}
                           </p>
-                        </button>
+                        </Button>
                       ))}
                     </div>
                   </div>
                 </div>
 
+                }
                 {/* Central Chat panel */}
-                <div className="lg:col-span-3 flex flex-col h-[620px] bg-white rounded-xl overflow-hidden shadow-sm ring-1 ring-[#E5E1D8]">
+                <div className="chat-conversation flex flex-col bg-white rounded-2xl overflow-hidden border border-stone-200">
                   
                   {/* Messages Scroll Area */}
                   <div ref={chatScrollRef} className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar bg-[#F9F7F2]/40">
@@ -769,7 +609,7 @@ export default function App() {
                             {/* Role label & timestamp */}
                             <div className={`flex items-center justify-between gap-6 mb-2 text-[10px] font-semibold ${msg.role === "user" ? "text-emerald-50" : "text-[#8A8478]"}`}>
                               <span className="font-serif uppercase">
-                                {msg.role === "user" ? "SAYA" : msg.role === "system" ? "PENGGERA SISTEM" : "EJEN ALIM PERUNDANGAN"}
+                                {msg.role === "user" ? "SAYA" : msg.role === "system" ? "Makluman" : "Mursyid AI"}
                               </span>
                               <span className="text-[9px] font-mono opacity-80">
                                 {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -822,7 +662,7 @@ export default function App() {
                                   Maklum balas jawapan
                                 </span>
                                 <div className="flex items-center gap-1.5">
-                                  <button
+                                  <Button
                                     type="button"
                                     disabled={isFeedbackSaving}
                                     onClick={() =>
@@ -841,8 +681,8 @@ export default function App() {
                                     aria-label="Jawapan membantu"
                                   >
                                     <ThumbsUp className="h-3.5 w-3.5" />
-                                  </button>
-                                  <button
+                                  </Button>
+                                  <Button
                                     type="button"
                                     disabled={isFeedbackSaving}
                                     onClick={() => {
@@ -858,7 +698,7 @@ export default function App() {
                                     aria-label="Perlu diperbaiki"
                                   >
                                     <ThumbsDown className="h-3.5 w-3.5" />
-                                  </button>
+                                  </Button>
                                 </div>
                               </div>
                             )}
@@ -872,7 +712,7 @@ export default function App() {
                     {isChatLoading && !streamingMessageId && (
                       <div className="flex justify-start">
                         <div className="bg-[#F9F7F2] border border-[#E5E1D8] rounded-2xl rounded-bl-none p-4 max-w-[80%] text-left shadow-sm">
-                          <span className="text-[10px] text-[#5A634A] font-bold block mb-2">EJEN ALIM SEDANG MENYEMAK HUJAH...</span>
+                          <span className="text-[10px] text-[#5A634A] font-bold block mb-2">Sedang menjawab…</span>
                           <div className="flex gap-1.5 items-center">
                             <span className="w-2.5 h-2.5 bg-[#5A634A] rounded-full animate-bounce delay-100" />
                             <span className="w-2.5 h-2.5 bg-[#8B9474] rounded-full animate-bounce delay-200" />
@@ -898,17 +738,17 @@ export default function App() {
                       type="text"
                       value={userInput}
                       onChange={(e) => setUserInput(e.target.value)}
-                      placeholder="Tulis soalan Syariah anda di sini (cthnya: Apakah rujukan hukum melabur emas secara ansuran?)..."
+                      aria-label="Soalan" placeholder="Tulis soalan anda…"
                       className="flex-1 px-3 py-3 rounded-lg border border-[#E5E1D8] bg-white text-sm text-[#3D3B36] focus:outline-none focus:ring-2 focus:ring-[#0F766E]/25 focus:border-[#0F766E] selection:bg-[#0F766E]/20"
                       disabled={isChatLoading}
                     />
-                    <button
-                      type="submit"
+                    <Button
+                      type="submit" variant="primary" aria-label="Hantar soalan"
                       disabled={isChatLoading || !userInput.trim()}
                       className="p-3 rounded-lg bg-[#0F766E] hover:bg-[#0B615A] disabled:bg-[#EAE7DF] disabled:text-[#8A8478] text-[#FDFBF7] transition-colors cursor-pointer shadow-sm flex items-center justify-center shrink-0"
                     >
                       <Send className="w-4 h-4" />
-                    </button>
+                    </Button>
                   </form>
                 </div>
               </motion.div>
@@ -924,43 +764,9 @@ export default function App() {
                 transition={{ duration: 0.2 }}
                 className="space-y-6"
               >
-                {/* Inner sub-tab navigation header */}
-                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-[#E5E1D8] pb-4 text-left">
-                  <div>
-                    <h3 className="font-serif text-lg font-bold text-[#2D2B26]">
-                      Graf Pengetahuan Syariah
-                    </h3>
-                    <p className="text-xs text-[#8A8478]">
-                      Teroka visualisasi ontologi fiqh atau imbas portal rasmi untuk mengemas kini graf.
-                    </p>
-                  </div>
-                  
-                  <div className="flex p-0.5 rounded-lg bg-[#F1F0EC] border border-[#D4D0C6] self-start md:self-auto shrink-0 shadow-sm">
-                    <button
-                      onClick={() => setGraphSubTab("visualize")}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-bold tracking-wide transition-all cursor-pointer ${
-                        graphSubTab === "visualize"
-                          ? "bg-white text-[#5A634A] shadow-sm ring-1 ring-[#D4D0C6]/50 font-extrabold"
-                          : "text-[#6D685E] hover:text-[#5A634A]"
-                      }`}
-                    >
-                      <Network className="w-3.5 h-3.5 shrink-0" />
-                      Teroka Graf
-                    </button>
-                    <button
-                      onClick={() => setGraphSubTab("ingest")}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-bold tracking-wide transition-all cursor-pointer ${
-                        graphSubTab === "ingest"
-                          ? "bg-white text-[#5A634A] shadow-sm ring-1 ring-[#D4D0C6]/50 font-extrabold"
-                          : "text-[#6D685E] hover:text-[#5A634A]"
-                      }`}
-                    >
-                      <Globe className="w-3.5 h-3.5 shrink-0" />
-                      Imbas Portal
-                    </button>
-                  </div>
-                </div>
-
+                <div className="page-heading"><div><p className="eyebrow">PETA ILMU</p><h2>Teroka</h2><p>{graphStatus}</p></div><Button onClick={() => refreshGraph(graphSearch)}><RefreshCw />Muat semula</Button></div>
+                <form className="flex gap-3" onSubmit={e => { e.preventDefault(); void refreshGraph(graphSearch); }}><div className="search-field"><Network /><input aria-label="Cari topik" placeholder="Cari topik…" value={graphSearch} onChange={e => setGraphSearch(e.target.value)} /></div><Button type="submit">Cari</Button></form>
+                {graphSearch && <div className="flex flex-wrap gap-2">{nodes.filter(node => node.label.toLocaleLowerCase().includes(graphSearch.toLocaleLowerCase())).slice(0, 12).map(node => <Button key={node.id} onClick={() => { setSelectedNode(node); setPendingSelectedNodeId(null); setGraphSearch(''); }}>{node.label}</Button>)}{!nodes.some(node => node.label.toLocaleLowerCase().includes(graphSearch.toLocaleLowerCase())) && <p role="status">Tiada padanan.</p>}</div>}
                 <>
                   {/* SUB-TAB 1: Visualize / Explore Ontologi */}
                   {graphSubTab === "visualize" && (
@@ -974,17 +780,6 @@ export default function App() {
                     >
                       {/* Left component: Interactive Graph Canvas (Takes 2 span cols) */}
                       <div className="lg:col-span-2 space-y-4">
-                        <div className="flex items-center justify-between">
-                          <div className="text-left">
-                            <h4 className="font-serif font-semibold text-[#2D2B26] flex items-center gap-1.5">
-                              Visualisasi Graf (D3)
-                            </h4>
-                            <p className="text-[11px] text-[#8A8478]">
-                              Susun nod dengan mengheret, skrol untuk zoom, klik nod untuk maklumat lanjut.
-                            </p>
-                          </div>
-                        </div>
-
                         <KnowledgeGraph
                           nodes={nodes}
                           links={links}
@@ -993,7 +788,6 @@ export default function App() {
                             setSelectedNode(node);
                           }}
                           selectedNodeId={selectedNode?.id}
-                          onResetGraph={handleResetGraph}
                         />
                       </div>
 
@@ -1001,7 +795,7 @@ export default function App() {
                       <div className="space-y-4 text-left">
                         <div>
                           <h4 className="font-serif font-semibold text-[#2D2B26] mb-3 block">
-                            Maklumat Entiti
+                            Butiran
                           </h4>
                           
                           <AnimatePresence mode="wait">
@@ -1018,9 +812,7 @@ export default function App() {
                                     <span className="rounded-full bg-[#E5F2EE] px-2.5 py-1 text-[10px] font-bold text-[#0F766E]">
                                       {selectedNode.type === "Artikkel" ? "Artikel" : selectedNode.type}
                                     </span>
-                                    <span className="rounded-full bg-white px-2.5 py-1 text-[10px] font-mono font-semibold text-[#6D685E] ring-1 ring-[#E5E1D8]">
-                                      #{selectedNode.id.replace(/_/g, "-").toLowerCase()}
-                                    </span>
+
                                   </div>
                                   <h5 className="font-serif font-bold text-[#2D2B26] text-lg leading-snug">
                                     {selectedNode.label}
@@ -1028,33 +820,19 @@ export default function App() {
                                 </div>
 
                                 <div className="space-y-4 text-sm">
-                                  <div className="grid grid-cols-[88px_1fr] gap-3">
-                                    <span className="text-[11px] font-semibold text-[#8A8478]">Kategori</span>
-                                    <span className="text-[#3D3B36]">
-                                      {selectedNode.type === "Artikkel" ? "Artikel" : selectedNode.type}
-                                    </span>
-                                  </div>
+
                                   <div className="grid grid-cols-[88px_1fr] gap-3">
                                     <span className="text-[11px] font-semibold text-[#8A8478]">Ringkasan</span>
                                     <p className="text-[#5A564E] leading-6">
                                       {selectedNode.description}
                                     </p>
                                   </div>
-                                  <div className="grid grid-cols-[88px_1fr] gap-3">
-                                    <span className="text-[11px] font-semibold text-[#8A8478]">Rujukan</span>
-                                    <p className="text-[#5A564E] leading-6">
-                                      Bersandar kepada hubungan langsung dalam graf semasa.
-                                    </p>
-                                  </div>
                                 </div>
-
-                                <div className="rounded-lg bg-white/75 px-3 py-2 text-[12px] leading-5 text-[#5A564E] ring-1 ring-[#E5E1D8]">
-                                  Kesan rujukan syarak akan berubah mengikut nod yang bersambung dengan entiti ini.
-                                </div>
+                                {selectedNode.evidence?.length ? <div className="space-y-3"><h6 className="text-sm font-semibold">Sumber</h6>{selectedNode.evidence.map((item, index) => <details key={`${item.documentId}-${index}`} className="text-sm"><summary className="cursor-pointer text-emerald-800">{item.title || 'Lihat sumber'}</summary><blockquote className="my-2 border-l-2 border-emerald-200 pl-3 text-stone-600">{item.quote}</blockquote>{item.conditions && <p className="mb-2">{item.conditions}</p>}<a href={item.url} target="_blank" rel="noreferrer" className="underline text-emerald-800">Buka sumber</a></details>)}</div> : null}
                               </motion.div>
                             ) : (
                               <div className="p-5 rounded-xl border border-[#E5E1D8] bg-[#F9F7F2]/30 text-[#8A8478] text-xs">
-                                Klik nod di sebelah kiri untuk melihat penerangan hukum Syariah.
+                                Pilih titik untuk melihat butiran.
                               </div>
                             )}
                           </AnimatePresence>
@@ -1064,55 +842,13 @@ export default function App() {
                     </motion.div>
                   )}
 
-                  {/* SUB-TAB 2: Web Ingestor & Crawler */}
-                  {graphSubTab === "ingest" && (
-                    <motion.div
-                      key="subtab-ingest"
-                      initial={{ opacity: 0, y: 5 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: -5 }}
-                      transition={{ duration: 0.15 }}
-                      className="space-y-6"
-                    >
-                      <CrawlerPanel
-                        onIndexComplete={refreshGraph}
-                        setError={setGlobalError}
-                      />
-                    </motion.div>
-                  )}
                 </>
               </motion.div>
             )}
 
-            {/* TAB 3: Sources Catalog */}
-            {activeTab === "sources" && (
-              <motion.div
-                key="sources-tab"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                transition={{ duration: 0.2 }}
-                className="space-y-6"
-              >
-                <div className="text-left max-w-3xl">
-                  <h3 className="font-serif font-bold text-xl text-[#2D2B26]">
-                    Senarai 10 Portal & Sumber Rujukan Utama Syariah Islam di Malaysia
-                  </h3>
-                  <p className="text-xs text-[#5A564E] leading-relaxed mt-1 font-sans">
-                    Aplikasi ini mengikat saringan rujukan hadis dan fatwa kepada domain-domain yang diisytiharkan sahih oleh penguasa tempatan demi menjamin ketepatan maklumat:
-                  </p>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {OFFICIAL_SOURCES.map((src) => (
-                    <SourceCard
-                      key={src.id}
-                      source={src}
-                    />
-                  ))}
-                </div>
-              </motion.div>
-            )}
+            {activeTab === "sources" && <Library />}
+            {activeTab === "curation" && <CurationPlan onComplete={() => refreshGraph()} />}
+            {activeTab === "ingest" && <CrawlerPanel onOpenUpdate={() => setActiveTab('curation')} />}
 
             {/* TAB 4: Feedback Analytics */}
             {activeTab === "analytics" && (
@@ -1126,19 +862,19 @@ export default function App() {
               >
                 <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-[#E5E1D8] pb-4">
                   <div>
-                    <h3 className="font-serif font-bold text-xl text-[#2D2B26]">Analytic Maklum Balas</h3>
+                    <h3 className="font-serif font-bold text-xl text-[#2D2B26]">Analitik Maklum Balas</h3>
                     <p className="text-xs text-[#5A564E] mt-1">
-                      Pantau kualiti jawapan berdasarkan thumbs up/down dan status pipeline penambahbaikan.
+                      Lihat maklum balas jawapan.
                     </p>
                   </div>
-                  <button
+                  <Button
                     type="button"
                     onClick={refreshFeedback}
                     className="inline-flex items-center gap-2 self-start rounded-lg border border-[#D4D0C6] bg-white px-3 py-2 text-xs font-semibold text-[#5A634A] hover:bg-[#F7F4ED]"
                   >
                     <RefreshCw className="h-3.5 w-3.5" />
                     Segar Semula
-                  </button>
+                  </Button>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -1172,13 +908,13 @@ export default function App() {
 
                 <div className="rounded-lg border border-[#E5E1D8] bg-[#F7F4ED] p-4 text-sm leading-6 text-[#5A564E]">
                   Pipeline auto-improvement direka sebagai human-in-the-loop: thumbs-down mencipta isu semakan,
-                  Review Bench mendraf pelan, kemudian reviewer menandakan sama ada perubahan prompt, sumber RAG,
+                  Semakan Maklum Balas mendraf pelan, kemudian reviewer menandakan sama ada perubahan prompt, sumber RAG,
                   atau fine-tuning patut dibuat.
                 </div>
               </motion.div>
             )}
 
-            {/* TAB 5: Human Review Bench */}
+            {/* TAB 5: Human Semakan Maklum Balas */}
             {activeTab === "review" && (
               <motion.div
                 key="review-tab"
@@ -1190,19 +926,19 @@ export default function App() {
               >
                 <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-[#E5E1D8] pb-4">
                   <div>
-                    <h3 className="font-serif font-bold text-xl text-[#2D2B26]">Review Bench</h3>
+                    <h3 className="font-serif font-bold text-xl text-[#2D2B26]">Semakan Maklum Balas</h3>
                     <p className="text-xs text-[#5A564E] mt-1">
-                      Semak maklum balas pengguna dan pilih tindakan penambahbaikan sebelum pipeline diterapkan.
+                      Semak jawapan yang perlu dibaiki.
                     </p>
                   </div>
-                  <button
+                  <Button
                     type="button"
                     onClick={refreshFeedback}
                     className="inline-flex items-center gap-2 self-start rounded-lg border border-[#D4D0C6] bg-white px-3 py-2 text-xs font-semibold text-[#5A634A] hover:bg-[#F7F4ED]"
                   >
                     <RefreshCw className="h-3.5 w-3.5" />
                     Segar Semula
-                  </button>
+                  </Button>
                 </div>
 
                 {feedbackRecords.length === 0 ? (
@@ -1250,20 +986,20 @@ export default function App() {
                               <option value="reviewing">reviewing</option>
                               <option value="resolved">resolved</option>
                             </select>
-                            <button
+                            <Button
                               type="button"
                               onClick={() => draftImprovementPlan(record)}
                               className="rounded-lg bg-[#0F766E] px-3 py-2 text-xs font-semibold text-white hover:bg-[#0B615A]"
                             >
-                              Draft Pipeline
-                            </button>
-                            <button
+                              Draf penambahbaikan
+                            </Button>
+                            <Button
                               type="button"
                               onClick={() => updateFeedbackRecord(record, { pipelineStatus: "applied", reviewStatus: "resolved" })}
                               className="rounded-lg border border-[#D4D0C6] bg-white px-3 py-2 text-xs font-semibold text-[#5A634A] hover:bg-[#F7F4ED]"
                             >
-                              Mark Applied
-                            </button>
+                              Tandakan selesai
+                            </Button>
                           </div>
                         </div>
 
@@ -1293,7 +1029,7 @@ export default function App() {
                         <textarea
                           defaultValue={record.reviewerNote}
                           onBlur={(event) => updateFeedbackRecord(record, { reviewerNote: event.target.value })}
-                          placeholder="Nota reviewer..."
+                          placeholder="Nota penyemak..."
                           className="mt-3 min-h-20 w-full rounded-lg border border-[#D4D0C6] bg-white p-3 text-sm text-[#3D3B36] focus:outline-none focus:ring-2 focus:ring-[#0F766E]/20"
                         />
                       </div>
@@ -1316,10 +1052,10 @@ export default function App() {
               <div>
                 <h3 className="font-serif text-lg font-bold text-[#2D2B26]">Apa yang perlu diperbaiki?</h3>
                 <p className="mt-1 text-xs leading-5 text-[#5A564E]">
-                  Maklum balas ini akan masuk ke Review Bench untuk disemak sebelum pipeline penambahbaikan diterapkan.
+                  Beritahu kami apa yang kurang tepat.
                 </p>
               </div>
-              <button
+              <Button
                 type="button"
                 onClick={() => {
                   setFeedbackModal(null);
@@ -1329,7 +1065,7 @@ export default function App() {
                 aria-label="Tutup"
               >
                 <X className="h-4 w-4" />
-              </button>
+              </Button>
             </div>
 
             <div className="mt-4 rounded-lg bg-[#F9F7F2]/70 p-3 text-xs leading-5 text-[#5A564E]">
@@ -1340,13 +1076,13 @@ export default function App() {
             <textarea
               value={feedbackComment}
               onChange={(event) => setFeedbackComment(event.target.value)}
-              placeholder="Contoh: jawapan tidak cukup sumber, tersalah hukum, perlu nyatakan khilaf, atau bahasa kurang jelas..."
+              placeholder="Apa yang perlu dibaiki?"
               className="mt-4 min-h-32 w-full rounded-lg border border-[#D4D0C6] bg-white p-3 text-sm text-[#3D3B36] focus:outline-none focus:ring-2 focus:ring-[#0F766E]/25"
               autoFocus
             />
 
             <div className="mt-4 flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
-              <button
+              <Button
                 type="button"
                 onClick={() => {
                   setFeedbackModal(null);
@@ -1355,25 +1091,21 @@ export default function App() {
                 className="rounded-lg border border-[#D4D0C6] bg-white px-4 py-2 text-xs font-semibold text-[#5A564E] hover:bg-[#F7F4ED]"
               >
                 Batal
-              </button>
-              <button
+              </Button>
+              <Button
                 type="button"
                 disabled={isFeedbackSaving}
                 onClick={handleThumbsDownSubmit}
                 className="rounded-lg bg-[#0F766E] px-4 py-2 text-xs font-semibold text-white hover:bg-[#0B615A] disabled:opacity-60"
               >
-                Hantar ke Review Bench
-              </button>
+                Hantar
+              </Button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Sincere literal Footer */}
-      <footer className="border-t border-[#E5E1D8] bg-[#5A564E] text-[#FDFBF7] py-6 px-8 text-center mt-12 text-[10px] font-sans tracking-wide leading-relaxed shadow-inner">
-        APLIKASI INTEGRASI PINTAR ISLAM • BAHASA MELAYU • REKAAN UNTUK STANDARD MAZHAB SYAFI'I DI MALAYSIA<br />
-        RUJUKAN SECARA LANGSUNG KEPADA JAKIM, JABATAN MUFTI WP, HARIAN METRO, BERITA HARIAN & WAKTUSOLAT.DIGITAL
-      </footer>
+      <footer className="app-footer">Mursyid AI · Ilmu dengan konteks dan rujukan</footer>
 
     </div>
   );

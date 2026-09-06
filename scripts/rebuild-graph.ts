@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { MODEL, PROMPT, fingerprint, hash, splitSections, validateExtraction, processDocument, graphRows, canActivate, EDGE_FIELDS, type Document, type Section } from './knowledge/core';
+import { MODEL, NODE_TYPES, PROMPT, fingerprint, hash, splitSections, validateExtraction, processDocument, graphRows, canActivate, EDGE_FIELDS, type Document, type Section } from './knowledge/core';
 import { CloudStore, PREFIX, tableFor, validateRelease, type Release } from './knowledge/cloud';
 
 dotenv.config({ quiet: true });
@@ -102,7 +102,7 @@ async function main() {
   const outputSchema = {
     type: Type.OBJECT, required: ['kind','reason','nodes','claims'], properties: {
       kind: { type: Type.STRING, enum: ['article','listing','unrelated','uncertain'] }, reason: { type: Type.STRING },
-      nodes: { type: Type.ARRAY, items: { type: Type.OBJECT, required: ['id','type','label','description','scope'], properties: Object.fromEntries(['id','type','label','description','scope'].map(key => [key, { type: Type.STRING }])) } },
+      nodes: { type: Type.ARRAY, items: { type: Type.OBJECT, required: ['id','type','label','description','scope'], properties: Object.fromEntries(['id','type','label','description','scope'].map(key => [key, key === 'type' ? { type: Type.STRING, enum: NODE_TYPES } : { type: Type.STRING }])) } },
       claims: { type: Type.ARRAY, items: { type: Type.OBJECT, required: ['source','target','relation','statement','quote','conditions','school','authority'], properties: Object.fromEntries(['source','target','relation','statement','quote','conditions','school','authority'].map(key => [key, { type: Type.STRING }])) } },
     },
   };

@@ -403,6 +403,7 @@ const MAX_SESSION_MESSAGES = 80;
 const memorySessions = new Map<string, { state: PersistedSessionState; expiresAt: number }>();
 let redisClient: ReturnType<typeof createClient> | null = null;
 let redisConnectPromise: Promise<void> | null = null;
+let redisRetryAfter = 0;
 
 const validTabs = new Set(["curation", "ingest", "chat", "graph", "sources", "analytics", "review", "engineering"]);
 const validGraphSubTabs = new Set(["visualize", "ingest"]);
@@ -546,30 +547,33 @@ function sanitizeSessionState(input: any, previous: PersistedSessionState = {}, 
 }
 
 async function getConnectedRedisClient(): Promise<ReturnType<typeof createClient> | null> {
-  if (!REDIS_URL) return null;
+  if ((!REDIS_URL && !REDIS_HOST) || Date.now() < redisRetryAfter) return null;
 
   if (!redisClient) {
-    redisClient = createClient({ url: REDIS_URL });
+    redisClient = createClient({
+      ...(REDIS_URL ? { url: REDIS_URL } : {}),
+      socket: { ...(!REDIS_URL ? { host: REDIS_HOST, port: REDIS_PORT } : {}), connectTimeout: REDIS_CONNECT_TIMEOUT_MS, reconnectStrategy: false },
+    });
     redisClient.on("error", (err) => {
       console.warn("Redis session store warning:", err.message);
     });
   }
 
-  if (!redisClient.isOpen && !redisConnectPromise) {
+  if (!redisClient.isReady && !redisConnectPromise) {
     redisConnectPromise = redisClient
       .connect()
       .then(() => undefined)
       .catch((err) => {
         console.warn("Redis session store unavailable; using in-memory sessions:", err.message);
-        redisConnectPromise = null;
-      });
+        redisRetryAfter = Date.now() + 30000;
+      }).finally(() => { redisConnectPromise = null; });
   }
 
   if (redisConnectPromise) {
     await redisConnectPromise;
   }
 
-  return redisClient.isOpen ? redisClient : null;
+  return redisClient.isReady ? redisClient : null;
 }
 
 function pruneExpiredMemorySessions() {
@@ -609,6 +613,9 @@ async function writeSessionState(sessionId: string, state: PersistedSessionState
   }
 
   pruneExpiredMemorySessions();
+  if (!memorySessions.has(sessionId) && memorySessions.size >= 200) {
+    memorySessions.delete(memorySessions.keys().next().value!);
+  }
   memorySessions.set(sessionId, {
     state,
     expiresAt: Date.now() + SESSION_TTL_SECONDS * 1000,

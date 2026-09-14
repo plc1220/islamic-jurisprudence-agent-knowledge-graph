@@ -191,3 +191,42 @@ test('admin HTTP action dispatches once; unauthorized callers cannot launch a jo
     for(const key of keys){if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key];}
   }
 });
+
+import { parseCrawlProgress } from '../scripts/knowledge/progress';
+test('crawl progress distinguishes starting a URL from completion and handles discovery',()=>{
+  const p=parseCrawlProgress([{textPayload:'Processing 125/5223: https://example.test/a',timestamp:'2026-09-14T06:41:28Z'}]);
+  assert.equal(p?.position,125);assert.equal(p?.total,5223);assert.equal(p?.updatedAt,'2026-09-14T06:41:28Z');
+  assert.equal(parseCrawlProgress([{textPayload:'Discovering URLs for Fixture (https://example.test).'}])?.position,null);
+  assert.equal(parseCrawlProgress([{textPayload:'Processing 2/0: https://example.test/a'}]),null);
+  assert.equal(parseCrawlProgress([{textPayload:'Processing 20/10: https://example.test/a'}]),null);
+  assert.equal(parseCrawlProgress([]),null);
+});
+
+test('status exposes cached progress only to admins and refreshes when execution changes',async()=>{
+  const keys=['GCP_PROJECT_ID','GCP_LOCATION','GCS_RAW_BUCKET','KNOWLEDGE_UPDATE_JOB','KNOWLEDGE_ADMIN_TOKEN'];
+  const previous=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+  Object.assign(process.env,{GCP_PROJECT_ID:'fixture-project',GCP_LOCATION:'fixture-region',GCS_RAW_BUCKET:'fixture-bucket',KNOWLEDGE_UPDATE_JOB:'fixture-job',KNOWLEDGE_ADMIN_TOKEN:'test-secret'});
+  const store=new VersionedMemory();let calls=0;let fail=false;
+  const execution='projects/fixture-project/locations/fixture-region/jobs/fixture-job/executions/fixture-one';
+  store.values.set('update.json',{...updateState(),phase:'crawl',execution});
+  const app=express();
+  registerKnowledgeRoutes(app,{store:store as any,request:async(method)=>{assert.equal(method,'GET');return {};},readLogs:async(name)=>{
+    calls++;assert.ok(name.startsWith('fixture-'));if(fail)throw new Error('Unavailable');
+    return [{textPayload:'Processing 125/5223: https://example.test/a',timestamp:'2026-09-14T06:41:28Z'}];
+  }});
+  const server=app.listen(0,'127.0.0.1');await new Promise<void>(r=>server.once('listening',r));
+  const url=`http://127.0.0.1:${(server.address() as any).port}/api/knowledge/status`;
+  const headers={Cookie:`mursyid_admin=${adminCookie('test-secret')}`};
+  try {
+    assert.equal((await (await fetch(url)).json()).crawlProgress,null);assert.equal(calls,0);
+    const results=await Promise.all([fetch(url,{headers}),fetch(url,{headers})]);
+    for(const r of results){assert.equal(r.headers.get('cache-control'),'no-store');const data=await r.json();assert.equal(data.crawlProgress.position,125);assert.ok(data.checkedAt);}
+    assert.equal(calls,1);
+    store.values.set('update.json',{...updateState(),phase:'crawl',execution:execution.replace('fixture-one','fixture-two')});fail=true;
+    const degraded=await (await fetch(url,{headers})).json();
+    assert.equal(calls,2);assert.equal(degraded.update.phase,'crawl');assert.equal(degraded.progressUnavailable,true);
+  } finally {
+    await new Promise<void>((resolve,reject)=>server.close(e=>e?reject(e):resolve()));
+    for(const key of keys){if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key];}
+  }
+});

@@ -414,7 +414,7 @@ resource "google_cloud_run_service_iam_member" "noauth" {
 resource "google_project_iam_custom_role" "knowledge_job_status" {
   role_id     = "mursyidKnowledgeJobStatus"
   title       = "Mursyid knowledge job status"
-  permissions = ["run.operations.get", "run.executions.get", "run.executions.list"]
+  permissions = ["run.operations.get", "run.executions.get", "run.executions.list", "logging.logEntries.list"]
   depends_on  = [google_project_service.apis]
 }
 

@@ -97,3 +97,9 @@ Frozen selection: 6,020 documents after ID/URL deduplication.
 Status when recorded: extraction running; not yet published. The prior graph remains active until validation and atomic publication succeed.
 
 The operator command `npx tsx scripts/start-saved-knowledge.ts --start` registers a single update and dispatches `scripts/saved-knowledge-worker.cjs` through the deployed job. It skips crawling, runs the existing extraction CLI, and publishes only after successful validation. Do not start a duplicate while this run is active. The normal admin action still includes discovery of new sources.
+
+### Live progress and session context
+
+The admin Ilmu page polls status every five seconds and displays the last successful check time. During crawling it reads the current execution's structured progress messages from Cloud Logging, with a ten-second process-local cache that also coalesces concurrent reads. The URL position means work has started on that list item; it is not a completed-document count. Last activity is shown separately so an unchanged worker timestamp remains visible. Missing log access degrades to the task phase with an explicit progress warning. Runtime access requires `logging.logEntries.list` in the existing knowledge job status role. Progress reads never dispatch or restart the job.
+
+Sessions use the existing Redis host/port when no explicit `REDIS_URL` is supplied. Sessions retain up to 80 messages plus UI context for the configured TTL (24 hours by default). Redis connection attempts have a bounded timeout and a 30-second retry backoff; the process-local fallback is capped at 200 sessions and does not survive instance replacement. Job state remains in Cloud Storage, independent of browser sessions and the progress cache.

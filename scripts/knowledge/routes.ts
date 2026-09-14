@@ -6,8 +6,9 @@ import { CloudStore, PREFIX, type Release } from './cloud';
 import { MODEL } from './core';
 import { adminCookie, checkSecret, isAdmin } from './admin';
 import { changeUpdate, isRunning, type UpdateState } from './update-flow';
+import { parseCrawlProgress, type CrawlProgress } from './progress';
 
-export function registerKnowledgeRoutes(app: Express, overrides: { store?: CloudStore; request?: (method: 'GET' | 'POST', name: string, data?: unknown) => Promise<any> } = {}) {
+export function registerKnowledgeRoutes(app: Express, overrides: { store?: CloudStore; request?: (method: 'GET' | 'POST', name: string, data?: unknown) => Promise<any>; readLogs?: (execution: string) => Promise<any[]> } = {}) {
   const project=process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || '';
   const region=process.env.GCP_LOCATION || 'asia-southeast1';
   const bucket=process.env.KNOWLEDGE_PIPELINE_BUCKET || process.env.GCS_RAW_BUCKET || '';
@@ -22,6 +23,26 @@ export function registerKnowledgeRoutes(app: Express, overrides: { store?: Cloud
     return (await (await auth.getClient()).request<any>({method,url:`https://run.googleapis.com/v2/${name}`,data,retry:false,timeout:15000})).data;
   };
   const request=overrides.request || cloudRequest;
+  let crawlCache: { execution: string; expires: number; value: Promise<{ crawlProgress: CrawlProgress | null; progressUnavailable: boolean }> } | null = null;
+  const readLogs=overrides.readLogs || (async(execution:string)=>{
+    const result=await (await auth.getClient()).request<any>({method:'POST',url:'https://logging.googleapis.com/v2/entries:list',timeout:5000,retry:false,data:{
+      resourceNames:[`projects/${project}`],
+      filter:`resource.type="cloud_run_job" AND resource.labels.job_name=${JSON.stringify(job)} AND labels."run.googleapis.com/execution_name"=${JSON.stringify(execution)} AND (textPayload:"Processing " OR textPayload:"Discovering URLs for " OR textPayload:"Discovered ")`,
+      orderBy:'timestamp desc',pageSize:5,
+    }});
+    return result.data.entries || [];
+  });
+  function crawlProgressFor(state:UpdateState) {
+    const execution=state.execution?.startsWith(`${jobPath}/executions/`) ? state.execution.split('/').pop() : '';
+    if(!execution) return Promise.resolve({crawlProgress:null,progressUnavailable:false});
+    if(crawlCache?.execution===execution && crawlCache.expires>Date.now()) return crawlCache.value;
+    const value=readLogs(execution).then(entries=>({crawlProgress:parseCrawlProgress(entries),progressUnavailable:false})).catch(error=>{
+      console.warn('Crawl progress unavailable:',error.message);
+      return {crawlProgress:null,progressUnavailable:true};
+    });
+    crawlCache={execution,expires:Date.now()+10000,value};
+    return value;
+  }
   const authorized=(req:Request)=>isAdmin(req.headers.cookie,secret);
   const sameOrigin=(req:Request)=>!req.headers.origin || req.headers.origin===`${req.protocol}://${req.get('host')}`;
   const requireAdmin=(req:Request,res:Response)=>{
@@ -72,7 +93,9 @@ export function registerKnowledgeRoutes(app: Express, overrides: { store?: Cloud
       const state=enabled && admin ? await reconcile(await store.read<UpdateState>('update.json')) : null;
       const active=project && bucket ? await store.read<Release>('active.json') : null;
       const progress=state && ['extract','publish'].includes(state.phase) ? await new CloudStore(store.storage,bucket,`${PREFIX}/runs/${state.runId}`).read('progress.json') : null;
-      res.json({enabled,admin,model:MODEL,active:active ? {version:active.version,documents:active.documents,edges:active.edges}:null,update:state ? {runId:state.runId,phase:state.phase,updatedAt:state.updatedAt}:null,progress});
+      const crawl=state?.phase==='crawl' ? await crawlProgressFor(state) : {crawlProgress:null,progressUnavailable:false};
+      res.setHeader('Cache-Control','no-store');
+      res.json({enabled,admin,model:MODEL,active:active ? {version:active.version,documents:active.documents,edges:active.edges}:null,update:state ? {runId:state.runId,phase:state.phase,updatedAt:state.updatedAt,requestedAt:state.requestedAt}:null,progress,...crawl,checkedAt:new Date().toISOString()});
     }catch(error:any){console.error('Knowledge status:',error.message);res.status(503).json({error:'Status tidak tersedia.'});}
   });
   app.post('/api/knowledge/update',async(req,res)=>{

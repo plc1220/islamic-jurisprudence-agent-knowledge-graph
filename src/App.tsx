@@ -394,7 +394,17 @@ export default function App() {
       let buffer = "";
 
       const handleStreamEvent = (event: any) => {
-        if (event.type === "metadata") {
+        if (event.type === "error" || event.error) {
+          throw new Error(event.error || "Gagal mendapatkan maklum balas daripada pelayan.");
+        }
+        if (!event.type && typeof event.text === "string") {
+          // Cache hits and insufficient-context responses use ordinary JSON.
+          citations = Array.isArray(event.citations) ? event.citations : [];
+          relevantGraph = event.relevantGraph;
+          responseId = event.responseId || responseId;
+          streamedText = event.text;
+          updateBotMessage({ content: streamedText, citations, relevantGraph, responseId, prompt: textToSend });
+        } else if (event.type === "metadata") {
           citations = Array.isArray(event.citations) ? event.citations : [];
           relevantGraph = event.relevantGraph;
           responseId = event.responseId || responseId;
@@ -425,6 +435,7 @@ export default function App() {
         }
       }
 
+      buffer += decoder.decode();
       if (buffer.trim()) {
         handleStreamEvent(JSON.parse(buffer));
       }

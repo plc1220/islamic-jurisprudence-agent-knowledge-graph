@@ -3443,6 +3443,10 @@ app.post("/api/chat", async (req, res) => {
     res.json({ text, citations, relevantGraph, responseId, cache: { hit: false } });
   } catch (error: any) {
     console.error("Chat Error:", error);
+    if (res.headersSent) {
+      res.end(`${JSON.stringify({ type: "error", error: error.message || "An unexpected error occurred" })}\n`);
+      return;
+    }
     res.status(500).json({ 
       error: error.message || "An unexpected error occurred",
       needsAdc: !isAdcConfigured()

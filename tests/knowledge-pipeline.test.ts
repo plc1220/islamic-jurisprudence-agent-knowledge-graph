@@ -209,6 +209,7 @@ test('status exposes cached progress only to admins and refreshes when execution
   const store=new VersionedMemory();let calls=0;let fail=false;
   const execution='projects/fixture-project/locations/fixture-region/jobs/fixture-job/executions/fixture-one';
   store.values.set('update.json',{...updateState(),phase:'crawl',execution});
+  store.values.set('runs/fixture-update/usage.json',{calls:2,tokens:{totalTokenCount:260}});
   const app=express();
   registerKnowledgeRoutes(app,{store:store as any,request:async(method)=>{assert.equal(method,'GET');return {};},readLogs:async(name)=>{
     calls++;assert.ok(name.startsWith('fixture-'));if(fail)throw new Error('Unavailable');
@@ -218,9 +219,10 @@ test('status exposes cached progress only to admins and refreshes when execution
   const url=`http://127.0.0.1:${(server.address() as any).port}/api/knowledge/status`;
   const headers={Cookie:`mursyid_admin=${adminCookie('test-secret')}`};
   try {
-    assert.equal((await (await fetch(url)).json()).crawlProgress,null);assert.equal(calls,0);
+    const publicStatus=await (await fetch(url)).json();
+    assert.equal(publicStatus.crawlProgress,null);assert.equal(publicStatus.usage,null);assert.equal(calls,0);
     const results=await Promise.all([fetch(url,{headers}),fetch(url,{headers})]);
-    for(const r of results){assert.equal(r.headers.get('cache-control'),'no-store');const data=await r.json();assert.equal(data.crawlProgress.position,125);assert.ok(data.checkedAt);}
+    for(const r of results){assert.equal(r.headers.get('cache-control'),'no-store');const data=await r.json();assert.equal(data.crawlProgress.position,125);assert.equal(data.usage.tokens.totalTokenCount,260);assert.ok(data.checkedAt);}
     assert.equal(calls,1);
     store.values.set('update.json',{...updateState(),phase:'crawl',execution:execution.replace('fixture-one','fixture-two')});fail=true;
     const degraded=await (await fetch(url,{headers})).json();

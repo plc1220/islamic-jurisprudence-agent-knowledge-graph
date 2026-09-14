@@ -9,7 +9,7 @@
     "start": "node dist/server.cjs",
     "lint": "tsc --noEmit",
     "graph:pipeline": "tsx scripts/rebuild-graph.ts",
-    "test:graph": "tsx --test tests/knowledge-pipeline.test.ts",
+    "test:graph": "tsx --test tests/knowledge-pipeline.test.ts tests/gemini-usage.test.ts",
     "knowledge:worker": "tsx scripts/update-knowledge.ts"
   },
   "dependencies": {

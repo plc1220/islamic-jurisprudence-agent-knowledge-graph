@@ -1,7 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { RefreshCw, CheckCircle2 } from 'lucide-react';
 import { Button } from './Button';
-type Status = { enabled:boolean;admin:boolean;model:string;active:{version:string;documents:number;edges:number}|null;update:{runId:string;phase:string;requestedAt?:string}|null;progress?:{completed:number;documents:number;failed:number};crawlProgress?:{position:number|null;total:number|null;url:string;updatedAt:string;detail:string};progressUnavailable?:boolean;checkedAt?:string };
+import { TokenUsage } from './TokenUsage';
+import type { UsageSummary } from '../../scripts/knowledge/usage';
+type Status = { enabled:boolean;admin:boolean;model:string;active:{version:string;documents:number;edges:number}|null;update:{runId:string;phase:string;requestedAt?:string}|null;progress?:{completed:number;documents:number;failed:number};crawlProgress?:{position:number|null;total:number|null;url:string;updatedAt:string;detail:string};progressUnavailable?:boolean;checkedAt?:string;usage?:UsageSummary|null };
 const labels:Record<string,string>={queued:'Dalam giliran', 'dispatch-unknown':'Menyemak status',crawl:'Menyemak sumber',extract:'Menyusun ilmu',publish:'Menerbitkan graf',complete:'Selesai',failed:'Kemas kini terhenti'};
 export function CurationPlan({onComplete}:{onComplete?:()=>void}) {
   const [status,setStatus]=useState<Status|null>(null);
@@ -47,6 +49,7 @@ export function CurationPlan({onComplete}:{onComplete?:()=>void}) {
       {running && status?.update?.phase==='crawl' && !status.crawlProgress && <p className="text-sm text-stone-500">{status.progressUnavailable?'Butiran kemajuan tidak dapat dibaca. Status tugas masih tersedia.':'Menunggu laporan kemajuan sumber…'}</p>}
       {running && <p className="text-sm text-stone-500">Sumber → Susun ilmu → Terbitkan graf. Graf sedia ada kekal sehingga penerbitan selesai.</p>}
       {status?.active && <div className="flex items-center gap-2 text-sm text-emerald-800"><CheckCircle2 className="h-4 w-4"/>{status.active.documents} artikel · {status.active.edges} hubungan</div>}
+      {status?.admin && status.update && <TokenUsage usage={status.usage ?? null}/>}
       {error && <p role="alert" className="text-sm text-rose-700">{error}</p>}
       {status?.checkedAt && <p className="text-xs text-stone-500">Disemak: {new Date(status.checkedAt).toLocaleTimeString('ms-MY')}{running?' · Semakan automatik setiap 5 saat':''}</p>}
       <Button variant="ghost" disabled={busy||checking} onClick={()=>{setError('');setPoll(p=>p+1);}}><RefreshCw className={checking?'animate-spin':''}/>{checking?'Menyemak…':'Semak status'}</Button>

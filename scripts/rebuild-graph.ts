@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { MODEL, NODE_TYPES, PROMPT, fingerprint, hash, splitSections, validateExtraction, processDocument, graphRows, canActivate, EDGE_FIELDS, type Document, type Section } from './knowledge/core';
 import { CloudStore, PREFIX, tableFor, validateRelease, type Release } from './knowledge/cloud';
+import { UsageTracker, tokenCounts, type UsageCall } from './knowledge/usage';
 
 dotenv.config({ quiet: true });
 const project = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || '';
@@ -71,7 +72,7 @@ async function main() {
     console.log(JSON.stringify({ mode: 'read-only', model: MODEL, limit: all ? 'all' : limit, sources: rows }, null, 2)); return;
   }
   if (command === 'status') {
-    console.log(JSON.stringify({ manifest: await store.read('manifest.json'), progress: await store.read('progress.json'), prepared: await store.read('prepared.json'), active: await root.read('active.json') }, null, 2)); return;
+    console.log(JSON.stringify({ manifest: await store.read('manifest.json'), progress: await store.read('progress.json'), usage: await store.read('usage.json'), prepared: await store.read('prepared.json'), active: await root.read('active.json') }, null, 2)); return;
   }
   if (command === 'publish' || command === 'activate') {
     const expectedArg = option('expected-active');
@@ -98,7 +99,24 @@ async function main() {
   await query(`CREATE TABLE IF NOT EXISTS ${table(inputTable)} AS ${selection}`, selectionParams);
   const documents = await query(`SELECT document_id, title, source_url, source_name, content, gcs_uri FROM ${table(inputTable)} ORDER BY document_id`);
   if (!documents.length) throw new Error('No source documents selected');
-  const ai = new GoogleGenAI({ vertexai: true, project, location: region, httpOptions: { timeout: 120000 } });
+  const tracking = await store.once('usage/tracking.json', { startedAt: new Date().toISOString() });
+  const usage = new UsageTracker({
+    list: async () => {
+      const [files] = await storage.bucket(bucket).getFiles({ prefix: `${store.prefix}/usage/calls/` });
+      const calls: UsageCall[] = [];
+      for (let i = 0; i < files.length; i += 25) {
+        calls.push(...await Promise.all(files.slice(i, i + 25).map(async file => JSON.parse((await file.download())[0].toString('utf8')) as UsageCall)));
+      }
+      return calls;
+    },
+    saveCall: call => store.once(`usage/calls/${call.id}.json`, call),
+    saveSummary: async summary => {
+      const previous = await store.readVersioned('usage.json');
+      await store.compareAndSwap('usage.json', summary, previous?.generation ?? 0);
+    },
+  }, MODEL, tracking.startedAt);
+  await usage.load();
+  const ai = new GoogleGenAI({ vertexai: true, project, location: region, httpOptions: { timeout: 120000, retryOptions: { attempts: 1 } } });
   const outputSchema = {
     type: Type.OBJECT, required: ['kind','reason','nodes','claims'], properties: {
       kind: { type: Type.STRING, enum: ['article','listing','unrelated','uncertain'] }, reason: { type: Type.STRING },
@@ -109,11 +127,20 @@ async function main() {
   const extract = async (document: Document, section: Section) => {
     let errorMessage = '';
     for (let attempt = 0; attempt < 3; attempt++) {
+      // Capture every response before JSON/evidence validation, including paid retries.
+      let response: Awaited<ReturnType<typeof ai.models.generateContent>> | undefined;
+      let requestError: any;
       try {
-        const response = await ai.models.generateContent({ model: MODEL,
+        response = await ai.models.generateContent({ model: MODEL,
           contents: JSON.stringify({ title: document.title, source: document.source_url, section: section.index, text: section.text, ...(errorMessage ? { validationErrorFromPreviousAttempt: errorMessage } : {}) }),
           config: { systemInstruction: PROMPT, responseMimeType: 'application/json', responseSchema: outputSchema, maxOutputTokens: 16384, thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } },
         });
+      } catch (error) { requestError = error; }
+      // Persistence is outside the retry block: storage errors must not repeat a Gemini call.
+      await usage.record({ id: randomUUID(), model: MODEL, documentId: document.document_id, section: section.index,
+        attempt: attempt + 1, at: new Date().toISOString(), requestFailed: Boolean(requestError), tokens: tokenCounts(response?.usageMetadata) });
+      try {
+        if (requestError) throw requestError;
         const result = JSON.parse(response.text || '');
         validateExtraction(result, document, section);
         return result;

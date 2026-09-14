@@ -7,6 +7,7 @@ import { MODEL } from './core';
 import { adminCookie, checkSecret, isAdmin } from './admin';
 import { changeUpdate, isRunning, type UpdateState } from './update-flow';
 import { parseCrawlProgress, type CrawlProgress } from './progress';
+import type { UsageSummary } from './usage';
 
 export function registerKnowledgeRoutes(app: Express, overrides: { store?: CloudStore; request?: (method: 'GET' | 'POST', name: string, data?: unknown) => Promise<any>; readLogs?: (execution: string) => Promise<any[]> } = {}) {
   const project=process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || '';
@@ -94,8 +95,9 @@ export function registerKnowledgeRoutes(app: Express, overrides: { store?: Cloud
       const active=project && bucket ? await store.read<Release>('active.json') : null;
       const progress=state && ['extract','publish'].includes(state.phase) ? await new CloudStore(store.storage,bucket,`${PREFIX}/runs/${state.runId}`).read('progress.json') : null;
       const crawl=state?.phase==='crawl' ? await crawlProgressFor(state) : {crawlProgress:null,progressUnavailable:false};
+      const usage=state ? await store.read<UsageSummary>(`runs/${state.runId}/usage.json`) : null;
       res.setHeader('Cache-Control','no-store');
-      res.json({enabled,admin,model:MODEL,active:active ? {version:active.version,documents:active.documents,edges:active.edges}:null,update:state ? {runId:state.runId,phase:state.phase,updatedAt:state.updatedAt,requestedAt:state.requestedAt}:null,progress,...crawl,checkedAt:new Date().toISOString()});
+      res.json({enabled,admin,model:MODEL,active:active ? {version:active.version,documents:active.documents,edges:active.edges}:null,update:state ? {runId:state.runId,phase:state.phase,updatedAt:state.updatedAt,requestedAt:state.requestedAt}:null,progress,usage,...crawl,checkedAt:new Date().toISOString()});
     }catch(error:any){console.error('Knowledge status:',error.message);res.status(503).json({error:'Status tidak tersedia.'});}
   });
   app.post('/api/knowledge/update',async(req,res)=>{

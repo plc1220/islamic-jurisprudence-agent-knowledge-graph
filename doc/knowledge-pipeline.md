@@ -128,3 +128,9 @@ selects exactly 2,000 fully checkpointed documents from the original frozen inpu
 The cache inventory contained 6,191 complete documents across earlier runs; the stopped execution's 1,849 counter only described documents visited in that execution, not the total reusable cache. A processed document can have excluded/listing sections and need not contribute an edge. Demo coverage is a selected subset, not a complete or representative scholarly corpus. The UI shows the release's document/edge totals; the graph viewport remains limited to 1,000 edge records and supports topic search.
 
 OKF/OpenWiki remains unimplemented. This release uses the existing evidence graph, BigQuery, and GCS.
+
+## Resume queue and persistent progress (2026-09-15)
+
+On startup the worker inventories artifact object names once and compares section keys against the frozen input snapshot. Only documents with missing sections enter the extraction queue; complete documents are counted as reused immediately. A durable per-attempt worklist records pending IDs. Partial documents still reuse their saved sections, including progress made immediately before an interruption.
+
+Progress reports `reused`, `newlyCompleted`, `remaining`, and failures; total completed is reused plus newly completed, so restarting does not reset it to zero. After extraction succeeds, a separate `assemble` stage validates every saved section and builds the release in bounded parallel batches. Assembly explicitly forbids model calls. Publication remains blocked by missing or invalid evidence. Paused/failed progress is also available in the admin UI.

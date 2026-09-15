@@ -93,7 +93,7 @@ export function registerKnowledgeRoutes(app: Express, overrides: { store?: Cloud
       const admin=authorized(req);
       const state=enabled && admin ? await reconcile(await store.read<UpdateState>('update.json')) : null;
       const active=project && bucket ? await store.read<Release>('active.json') : null;
-      const progress=state && ['extract','publish'].includes(state.phase) ? await new CloudStore(store.storage,bucket,`${PREFIX}/runs/${state.runId}`).read('progress.json') : null;
+      const progress=state && ['extract','publish','failed'].includes(state.phase) ? await new CloudStore(store.storage,bucket,`${PREFIX}/runs/${state.runId}`).read('progress.json') : null;
       const crawl=state?.phase==='crawl' ? await crawlProgressFor(state) : {crawlProgress:null,progressUnavailable:false};
       const usage=state ? await store.read<UsageSummary>(`runs/${state.runId}/usage.json`) : null;
       res.setHeader('Cache-Control','no-store');

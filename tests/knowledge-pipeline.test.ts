@@ -266,3 +266,18 @@ test('cached demo selects exact source-balanced count, excludes partial document
   assert.deepEqual(selectCachedDocuments(docs,keys,2).map(d=>d.document_id),['a','c']);
   assert.throws(()=>selectCachedDocuments(docs,keys,4),/Only 3/);
 });
+
+test('resume queue excludes fully saved documents and retains missing and partial documents across restarts',async()=>{
+  const {planResume}=await import('../scripts/knowledge/resume');
+  const {artifactKeys}=await import('../scripts/knowledge/demo');
+  const full={...doc,document_id:'full'}, partial={...doc,document_id:'partial',content:'x'.repeat(14000)},missing={...doc,document_id:'missing'};
+  const keys=new Set([...artifactKeys(full),artifactKeys(partial)[0]]);
+  const first=planResume([full,partial,missing],keys);
+  assert.deepEqual(first.saved.map(d=>d.document_id),['full']);
+  assert.deepEqual(first.pending.map(d=>d.document_id),['partial','missing']);
+  artifactKeys(partial).forEach(k=>keys.add(k));
+  const resumed=planResume([full,partial,missing],keys);
+  assert.equal(resumed.saved.length,2);
+  assert.deepEqual(resumed.pending.map(d=>d.document_id),['missing']);
+  assert.equal(planResume([{...full,content:full.content+' changed'}],keys).pending.length,1);
+});

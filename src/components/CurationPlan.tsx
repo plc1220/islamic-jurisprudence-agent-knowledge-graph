@@ -3,7 +3,7 @@ import { RefreshCw, CheckCircle2 } from 'lucide-react';
 import { Button } from './Button';
 import { TokenUsage } from './TokenUsage';
 import type { UsageSummary } from '../../scripts/knowledge/usage';
-type Status = { enabled:boolean;admin:boolean;model:string;active:{version:string;documents:number;edges:number}|null;update:{runId:string;phase:string;requestedAt?:string;error?:string;failedPhase?:string;coverageWarnings?:string[]}|null;progress?:{completed:number;documents:number;failed:number};crawlProgress?:{position:number|null;total:number|null;url:string;updatedAt:string;detail:string};progressUnavailable?:boolean;checkedAt?:string;usage?:UsageSummary|null };
+type Status = { enabled:boolean;admin:boolean;model:string;active:{version:string;documents:number;edges:number}|null;update:{runId:string;phase:string;requestedAt?:string;error?:string;failedPhase?:string;coverageWarnings?:string[]}|null;progress?:{completed:number;documents:number;failed:number;reused?:number;newlyCompleted?:number;remaining?:number;pendingAtStart?:number;stage?:string;assembled?:number};crawlProgress?:{position:number|null;total:number|null;url:string;updatedAt:string;detail:string};progressUnavailable?:boolean;checkedAt?:string;usage?:UsageSummary|null };
 const labels:Record<string,string>={queued:'Dalam giliran', 'dispatch-unknown':'Menyemak status',crawl:'Menyemak sumber',load:'Memuatkan indeks',extract:'Menyusun ilmu',publish:'Menerbitkan graf',complete:'Selesai',failed:'Kemas kini terhenti'};
 export function CurationPlan({onComplete}:{onComplete?:()=>void}) {
   const [status,setStatus]=useState<Status|null>(null);
@@ -36,7 +36,14 @@ export function CurationPlan({onComplete}:{onComplete?:()=>void}) {
       <div className="flex items-center justify-between gap-4"><strong>Gemini 3.7 Flash</strong><span className="text-sm text-stone-500">{status?.update ? labels[status.update.phase] : 'Sedia'}</span></div>
       <p className="text-sm text-stone-500">Tambah yang baharu. Guna semula yang sama.</p>
       {!status ? <p role="status">Memuatkan…</p> : !status.enabled ? <p>Kemas kini belum disediakan.</p> : !status.admin ? <form className="flex flex-wrap gap-3" onSubmit={e=>{e.preventDefault();void action('/api/knowledge/login',{token});}}><input type="password" aria-label="Kod admin" placeholder="Kod admin" autoComplete="current-password" value={token} onChange={e=>setToken(e.target.value)} className="border border-stone-200 rounded-lg px-3 py-2"/><Button type="submit" disabled={busy||!token}>Masuk</Button></form> : <Button variant="primary" disabled={busy||running} onClick={()=>void action('/api/knowledge/update',{})}><RefreshCw className={running?'animate-spin':''}/>{running?'Sedang dikemas kini…':status.update?.phase==='failed'?'Cuba lagi':'Kemas kini'}</Button>}
-      {running && status?.progress && <p role="status" className="text-sm">{status.progress.completed} / {status.progress.documents} artikel</p>}
+      {status?.progress && <div role="status" className="space-y-2 text-sm">
+        <p>{status.progress.completed.toLocaleString()} / {status.progress.documents.toLocaleString()} dokumen tersimpan</p>
+        {status.progress.reused !== undefined && <>
+          <p>Guna semula: {status.progress.reused.toLocaleString()} · Baharu selesai: {(status.progress.newlyCompleted || 0).toLocaleString()} · Belum selesai: {(status.progress.remaining ?? 0).toLocaleString()}</p>
+          <p>Perlu dicuba lagi: {status.progress.failed.toLocaleString()}</p>
+          {status.progress.stage==='assemble' ? <p>Menyediakan graf daripada hasil tersimpan: {(status.progress.assembled || 0).toLocaleString()} / {status.progress.documents.toLocaleString()}. Tiada pengekstrakan Gemini pada peringkat ini.</p> : <p>Hanya dokumen belum selesai diproses. Bahagian yang tersimpan digunakan semula.</p>}
+        </>}
+      </div>}
       {running && status?.crawlProgress && <div className="space-y-2 text-sm" role="status">
         {status.crawlProgress.position!==null && status.crawlProgress.total ? <>
           <p>Memproses URL {status.crawlProgress.position.toLocaleString()} daripada {status.crawlProgress.total.toLocaleString()}</p>

@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { MODEL, NODE_TYPES, PROMPT, fingerprint, hash, splitSections, validateExtraction, processDocument, graphRows, canActivate, EDGE_FIELDS, type Document, type Section, type Store } from './knowledge/core';
 import { CloudStore, PREFIX, tableFor, validateRelease, type Release } from './knowledge/cloud';
+import { planResume } from './knowledge/resume';
 import { artifactKeys, selectCachedDocuments } from './knowledge/demo';
 import { UsageTracker, tokenCounts, type UsageCall } from './knowledge/usage';
 
@@ -129,6 +130,20 @@ async function main() {
   await query(`CREATE TABLE IF NOT EXISTS ${table(inputTable)} AS ${selection}`, selectionParams);
   const documents = await query(`SELECT document_id, title, source_url, source_name, content, gcs_uri FROM ${table(inputTable)} ORDER BY document_id`);
   if (!documents.length) throw new Error('No source documents selected');
+  const [artifactFiles] = await storage.bucket(bucket).getFiles({prefix:`${PREFIX}/artifacts/documents/`});
+  const available = new Set(artifactFiles.map(file=>file.name.slice(`${PREFIX}/artifacts/`.length)));
+  const work = planResume(documents as Document[], available);
+  let completed = work.saved.length, failed = 0, newlyCompleted = 0;
+  const progress = async (stage:'extract'|'assemble'|'incomplete', assembled = 0) => {
+    const value = {runId,model:MODEL,documents:documents.length,completed,failed,reused:work.saved.length,
+      newlyCompleted,pendingAtStart:work.pending.length,remaining:documents.length-completed,stage,assembled,
+      status:stage==='incomplete'?'incomplete':'running',updatedAt:new Date().toISOString()};
+    const previous=await store.readVersioned('progress.json');
+    await store.compareAndSwap('progress.json',value,previous?.generation ?? 0);
+    console.log(JSON.stringify(value));
+  };
+  await store.once(`worklists/${randomUUID()}.json`,{at:new Date().toISOString(),fingerprint:fingerprint(),reused:work.saved.length,pendingIds:work.pending.map(d=>d.document_id)});
+  await progress('extract');
   const tracking = await store.once('usage/tracking.json', { startedAt: new Date().toISOString() });
   const usage = new UsageTracker({
     list: async () => {
@@ -184,46 +199,52 @@ async function main() {
     }
     throw new Error('Extraction attempts exhausted');
   };
-  let completed = 0, failed = 0, sections = 0, excludedSections = 0, uncertainSections = 0;
-  const edges: ReturnType<typeof graphRows> = [];
-  // One Cloud Run task; document/section checkpoints make retries independent of corpus hashes.
-  for (const row of documents) {
+  const resolveDocument = async (row:any):Promise<Document> => {
+    if(row.content?.trim()) return row as Document;
+    const docKey=`source/${hash(row.document_id)}.json`;
+    const saved=await store.read<Document>(docKey);
+    if(saved) return saved;
+    const match=/^gs:\/\/([^/]+)\/(.+)$/.exec(row.gcs_uri || '');
+    if(!match || match[1] !== (process.env.GCS_RAW_BUCKET || bucket) || !match[2].startsWith('raw/')) throw new Error('Missing stored content or allowed snapshot');
+    const content=(await storage.bucket(match[1]).file(match[2]).download())[0].toString('utf8');
+    return store.once(docKey,{document_id:row.document_id,title:row.title||'',source_url:row.source_url||'',source_name:row.source_name||'',content});
+  };
+  // Extraction visits only unfinished documents, reusing saved sections within partial documents.
+  for(const row of work.pending) {
     try {
-      const docKey = `source/${hash(row.document_id)}.json`;
-      let document = cachedFromRun ? row as Document : await store.read<Document>(docKey);
-      if (!document) {
-        let content = row.content || '';
-        if (!content.trim()) {
-          const match = /^gs:\/\/([^/]+)\/(.+)$/.exec(row.gcs_uri || '');
-          const rawBucket = process.env.GCS_RAW_BUCKET || bucket;
-          if (!match || match[1] !== rawBucket || !match[2].startsWith('raw/')) throw new Error('Missing stored content or allowed snapshot');
-          content = (await storage.bucket(match[1]).file(match[2]).download())[0].toString('utf8');
-        }
-        document = await store.once(docKey, { document_id: row.document_id, title: row.title || '', source_url: row.source_url || '', source_name: row.source_name || '', content });
-      }
-      const results = await processDocument(document, artifacts, extract);
-      edges.push(...graphRows(document, results, runId, manifest.createdAt));
-      sections += results.length;
-      excludedSections += results.filter(result => result.kind !== 'article').length;
-      uncertainSections += results.filter(result => result.kind === 'uncertain').length;
-      completed++;
-    } catch (error: any) {
+      await processDocument(await resolveDocument(row),artifacts,extract);
+      completed++; newlyCompleted++;
+    } catch(error:any) {
       failed++;
-      const message = String(error.message || 'Document failed').slice(0, 1000);
-      await store.once(`failures/${hash(row.document_id)}/${randomUUID()}.json`, { documentId: row.document_id, message, at: new Date().toISOString() });
-      console.error(JSON.stringify({ documentId: row.document_id, error: message }));
+      const message=String(error.message || 'Document failed').slice(0,1000);
+      await store.once(`failures/${hash(row.document_id)}/${randomUUID()}.json`,{documentId:row.document_id,message,at:new Date().toISOString()});
+      console.error(JSON.stringify({documentId:row.document_id,error:message}));
     }
-    const progress = { runId, model: MODEL, documents: documents.length, completed, failed, edges: edges.length, updatedAt: new Date().toISOString(), status: 'running' };
-    if (cachedFromRun && (completed + failed) % 25 !== 0 && completed + failed !== documents.length) continue;
-    const previous = await store.readVersioned('progress.json');
-    try { await store.compareAndSwap('progress.json', progress, previous?.generation ?? 0); } catch (error: any) { if (Number(error.code) !== 412) throw error; }
-    console.log(JSON.stringify({ completed, failed, total: documents.length }));
+    await progress('extract');
   }
-  if (failed || !edges.length) {
-    const previous = await store.readVersioned('progress.json');
-    await store.compareAndSwap('progress.json', { runId, model: MODEL, documents: documents.length, completed, failed, edges: edges.length, status: 'incomplete', updatedAt: new Date().toISOString() }, previous?.generation ?? 0);
-    throw new Error(`${failed} documents failed; ${edges.length} edges staged in checkpoints. Nothing published. Resume the same run to retry.`);
+  if(failed) {
+    await progress('incomplete');
+    throw new Error(`${failed} documents failed; successful sections remain saved. Nothing published. Resume to retry only unfinished documents.`);
   }
+  // Publication must still verify every saved evidence record, separately from extraction.
+  let sections=0, excludedSections=0, uncertainSections=0;
+  const edges:ReturnType<typeof graphRows>=[];
+  await progress('assemble');
+  for(let index=0;index<documents.length;index+=25) {
+    const batch=await Promise.all(documents.slice(index,index+25).map(async row=>{
+      const document=await resolveDocument(row);
+      const results=await processDocument(document,artifacts,async()=>{throw new Error('Missing checkpoint during graph assembly; resume extraction.');});
+      return {document,results};
+    }));
+    for(const {document,results} of batch) {
+      edges.push(...graphRows(document,results,runId,manifest.createdAt));
+      sections+=results.length;
+      excludedSections+=results.filter(result=>result.kind!=='article').length;
+      uncertainSections+=results.filter(result=>result.kind==='uncertain').length;
+    }
+    if(index%100===0 || index+25>=documents.length) await progress('assemble',Math.min(index+25,documents.length));
+  }
+  if(!edges.length) throw new Error('No supported graph edges. Nothing published.');
   const releaseTable = tableFor(runId);
   const directory = await mkdtemp(path.join(tmpdir(), 'mursyid-graph-'));
   try {

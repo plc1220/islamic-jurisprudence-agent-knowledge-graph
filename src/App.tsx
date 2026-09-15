@@ -470,7 +470,7 @@ export default function App() {
       const data = await response.json();
       if (!response.ok || !Array.isArray(data.nodes) || !Array.isArray(data.links)) throw new Error("Graf tidak tersedia.");
       if (response.ok && data.nodes && data.links) {
-        setGraphStatus(data.origin === "bigquery" ? `Graf tersimpan · belum disemak${data.truncated ? " · sebahagian graf" : ""}` : "Graf contoh · data tidak tersedia");
+        setGraphStatus(data.origin === "bigquery" ? `Graf tersimpan${data.documents ? ` · ${data.documents.toLocaleString()} dokumen` : ""}${data.totalEdges ? ` · ${data.totalEdges.toLocaleString()} hubungan` : ""} · belum disemak${data.truncated ? " · paparan sebahagian; cari topik untuk teroka" : ""}` : "Graf contoh · data tidak tersedia");
         setNodes(data.nodes);
         setLinks(data.links);
         setSelectedNode((current) => {

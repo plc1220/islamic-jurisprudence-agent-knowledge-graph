@@ -2565,7 +2565,7 @@ async function getFullGraphFromBigQuery(search = "") {
     LIMIT 1001
   `, { search });
   return { ...buildGraphView(rows.slice(0, 1000)), truncated: rows.length > 1000,
-    version: release?.version || 'legacy', model: release?.model || null, totalEdges: release?.edges ?? null,
+    version: release?.version || 'legacy', documents: release?.documents ?? null, model: release?.model || null, totalEdges: release?.edges ?? null,
     reviewStatus: release?.reviewStatus || 'legacy', search };
 }
 

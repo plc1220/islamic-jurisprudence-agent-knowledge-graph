@@ -119,3 +119,12 @@ The failed `update-0120f295-c7a3-41a2-ba5f-3c37a0d4da3e` run saved 1,299 corpus 
 A durable `backfills/RUN/recovery.json` receipt records the merged counts and failure accounting. Corpus merges update `knowledge-pipeline/corpus-version.json`; API readers include that version in retrieval/response cache keys. Completed update stages are checkpointed, and retries reuse the run ID and skip completed stages. Loading is a distinct visible phase, and failure details are exposed only to admins. After verifying a recovery receipt and the active graph version, an operator may checkpoint `crawl` complete to resume the same update at extraction.
 
 Short-query retrieval now permits a single informative keyword when it occurs in an article title. When vector candidates fail relevance checks, a keyword fallback searches stored chunks, excludes pagination URLs, and returns distinct documents. Keyword citations are labelled separately from vector citations. Ambiguous short questions should elicit clarification rather than a specific ruling.
+
+## Demo from saved extractions (2026-09-15)
+
+`run --run-id demo-2000-20260915 --limit 2000 --cached-from-run update-0120f295-c7a3-41a2-ba5f-3c37a0d4da3e`
+selects exactly 2,000 fully checkpointed documents from the original frozen input table, round-robin across available sources. The selection and separate demo snapshot are persisted. All saved section evidence is revalidated; any invalid record blocks publication. Gemini calls are explicitly disabled in this mode. The original full-corpus run and its artifacts remain available.
+
+The cache inventory contained 6,191 complete documents across earlier runs; the stopped execution's 1,849 counter only described documents visited in that execution, not the total reusable cache. A processed document can have excluded/listing sections and need not contribute an edge. Demo coverage is a selected subset, not a complete or representative scholarly corpus. The UI shows the release's document/edge totals; the graph viewport remains limited to 1,000 edge records and supports topic search.
+
+OKF/OpenWiki remains unimplemented. This release uses the existing evidence graph, BigQuery, and GCS.

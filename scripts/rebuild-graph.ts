@@ -6,8 +6,9 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { MODEL, NODE_TYPES, PROMPT, fingerprint, hash, splitSections, validateExtraction, processDocument, graphRows, canActivate, EDGE_FIELDS, type Document, type Section } from './knowledge/core';
+import { MODEL, NODE_TYPES, PROMPT, fingerprint, hash, splitSections, validateExtraction, processDocument, graphRows, canActivate, EDGE_FIELDS, type Document, type Section, type Store } from './knowledge/core';
 import { CloudStore, PREFIX, tableFor, validateRelease, type Release } from './knowledge/cloud';
+import { artifactKeys, selectCachedDocuments } from './knowledge/demo';
 import { UsageTracker, tokenCounts, type UsageCall } from './knowledge/usage';
 
 dotenv.config({ quiet: true });
@@ -22,6 +23,7 @@ function option(name: string, fallback = '') { const index = args.indexOf(`--${n
 const help = `Stored-corpus graph pipeline (Gemini ${MODEL}). No crawling.
   npm run graph:pipeline -- plan [--limit 50 | --all] [--source NAME]
   npm run graph:pipeline -- run --run-id NAME [--limit 50 | --all] [--source NAME]
+  npm run graph:pipeline -- run --run-id DEMO --limit 2000 --cached-from-run ORIGINAL
   npm run graph:pipeline -- status --run-id NAME
   npm run graph:pipeline -- publish --run-id NAME --expected-active VERSION_OR_legacy
   npm run graph:pipeline -- activate --run-id PREVIOUS_NAME --expected-active CURRENT_VERSION
@@ -29,12 +31,13 @@ const help = `Stored-corpus graph pipeline (Gemini ${MODEL}). No crawling.
 plan reads corpus only. run calls Gemini and stages a graph; it does not publish.
 Repeat run with the SAME ID and options to resume. Use a NEW ID for changed inputs/config.
 publish/activate require an explicit expected active version and never overwrite the legacy graph.
+--cached-from-run selects fully saved documents from a previous snapshot, balanced across sources, and forbids Gemini calls.
 Default limit 50; --all is required for the full corpus. No knowledge generation runs on server startup.`;
 
 async function main() {
   if (command === 'help' || args.includes('--help')) { console.log(help); return; }
   if (!['plan','run','status','publish','activate'].includes(command)) throw new Error('Unknown command; use help');
-  const known = new Set(['--limit','--all','--source','--run-id','--expected-active']);
+  const known = new Set(['--limit','--all','--source','--run-id','--expected-active','--cached-from-run']);
   for (let i = 0; i < args.length; i++) {
     if (!known.has(args[i])) throw new Error(`Unknown argument ${args[i]}`);
     if (args[i] !== '--all') { if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error(`Missing value for ${args[i]}`); i++; }
@@ -52,7 +55,7 @@ async function main() {
   const storage = new Storage({ projectId: project });
   const root = new CloudStore(storage, bucket, PREFIX);
   const store = new CloudStore(storage, bucket, `${PREFIX}/runs/${runId}`);
-  const artifacts = new CloudStore(storage, bucket, `${PREFIX}/artifacts`);
+  let artifacts: Store = new CloudStore(storage, bucket, `${PREFIX}/artifacts`);
   const table = (name: string) => { if (!/^[a-zA-Z_]\w*$/.test(name)) throw new Error('Invalid table ID'); return `\`${project}.${dataset}.${name}\``; };
   const query = async (sql: string, params: Record<string, any> = {}) => (await bq.query({ query: sql, params, location }))[0];
   const inputTable = `graph_input_${hash(runId).slice(0, 24)}`;
@@ -91,7 +94,34 @@ async function main() {
     console.log(JSON.stringify({ active: runId, previous: active?.value.version || 'legacy', edges: release.edges, reviewStatus: release.reviewStatus })); return;
   }
 
-  const manifestConfig = { runId, project, dataset, inputTable, model: MODEL, fingerprint: fingerprint(), source, limit: all ? 0 : limit };
+  const cachedFromRun = option('cached-from-run');
+  if (cachedFromRun && (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{2,79}$/.test(cachedFromRun) || all || source)) throw new Error('Cached demo requires a valid source run and --limit; no --all or --source');
+  if (cachedFromRun) {
+    const original = await root.read<any>(`runs/${cachedFromRun}/manifest.json`);
+    if (!original || original.fingerprint !== fingerprint() || original.project !== project || original.dataset !== dataset || original.inputTable !== `graph_input_${hash(cachedFromRun).slice(0,24)}`) throw new Error('Source snapshot/configuration mismatch');
+    const [files] = await storage.bucket(bucket).getFiles({prefix:`${PREFIX}/artifacts/documents/`});
+    const available = new Set(files.map(file=>file.name.slice(`${PREFIX}/artifacts/`.length)));
+    const [exists] = await bq.dataset(dataset).table(inputTable).exists();
+    if (!exists) {
+      const candidates = await query(`SELECT * FROM ${table(original.inputTable)}`);
+      const selected = selectCachedDocuments(candidates as Document[], available, limit);
+      await query(`CREATE TABLE ${table(inputTable)} AS SELECT * FROM ${table(original.inputTable)} WHERE document_id IN UNNEST(@ids)`, {ids:selected.map(document=>document.document_id)});
+    }
+    const selected = await query(`SELECT * FROM ${table(inputTable)}`) as Document[];
+    if(selected.length!==limit) throw new Error('Demo snapshot count mismatch');
+    const keys=selected.flatMap(artifactKeys);
+    const cached=new Map<string,any>();
+    for(let i=0;i<keys.length;i+=25) {
+      await Promise.all(keys.slice(i,i+25).map(async key=>{
+        const [bytes]=await storage.bucket(bucket).file(`${PREFIX}/artifacts/${key}`).download();
+        cached.set(key,JSON.parse(bytes.toString('utf8')));
+      }));
+    }
+    artifacts={read:async <T>(key:string)=>cached.get(key) as T ?? null,once:async()=>{throw new Error('Cached-only demo cannot write extraction artifacts');}};
+    await store.once('selection.json',{cachedFromRun,limit,policy:'fully-checkpointed-source-balanced',documentIds:selected.map(document=>document.document_id)});
+    console.log(JSON.stringify({cachedOnly:true,documents:selected.length,sections:keys.length,geminiCalls:0}));
+  }
+  const manifestConfig = { runId, project, dataset, inputTable, model: MODEL, fingerprint: fingerprint(), source, limit: all ? 0 : limit, ...(cachedFromRun ? {cachedFromRun} : {}) };
   const manifest = await store.once('manifest.json', { ...manifestConfig, createdAt: new Date().toISOString() });
   for (const key of Object.keys(manifestConfig)) if (manifest[key] !== manifestConfig[key]) throw new Error(`Run configuration changed (${key}); use a new run ID`);
   const prepared = await store.read<Release>('prepared.json');
@@ -125,6 +155,7 @@ async function main() {
     },
   };
   const extract = async (document: Document, section: Section) => {
+    if (cachedFromRun) throw new Error('Cached-only demo: missing saved section; Gemini calls are disabled');
     let errorMessage = '';
     for (let attempt = 0; attempt < 3; attempt++) {
       // Capture every response before JSON/evidence validation, including paid retries.
@@ -159,7 +190,7 @@ async function main() {
   for (const row of documents) {
     try {
       const docKey = `source/${hash(row.document_id)}.json`;
-      let document = await store.read<Document>(docKey);
+      let document = cachedFromRun ? row as Document : await store.read<Document>(docKey);
       if (!document) {
         let content = row.content || '';
         if (!content.trim()) {
@@ -183,6 +214,7 @@ async function main() {
       console.error(JSON.stringify({ documentId: row.document_id, error: message }));
     }
     const progress = { runId, model: MODEL, documents: documents.length, completed, failed, edges: edges.length, updatedAt: new Date().toISOString(), status: 'running' };
+    if (cachedFromRun && (completed + failed) % 25 !== 0 && completed + failed !== documents.length) continue;
     const previous = await store.readVersioned('progress.json');
     try { await store.compareAndSwap('progress.json', progress, previous?.generation ?? 0); } catch (error: any) { if (Number(error.code) !== 412) throw error; }
     console.log(JSON.stringify({ completed, failed, total: documents.length }));

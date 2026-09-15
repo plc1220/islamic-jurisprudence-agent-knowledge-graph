@@ -257,3 +257,12 @@ test('one meaningful keyword can match an article title without accepting incide
  assert.equal(relevantKeywordMatch([],['qada'],['qada']),false);
  assert.equal(relevantKeywordMatch(['qada','puasa'],['qada','puasa'],[]),true);
 });
+
+test('cached demo selects exact source-balanced count, excludes partial documents, and fails without enough saved work',async()=>{
+  const {artifactKeys,selectCachedDocuments}=await import('../scripts/knowledge/demo');
+  const docs=[{...doc,document_id:'a',source_name:'one'},{...doc,document_id:'b',source_name:'one'},{...doc,document_id:'c',source_name:'two'},{...doc,document_id:'d',content:'x'.repeat(14000),source_name:'two'}];
+  const keys=new Set(docs.slice(0,3).flatMap(artifactKeys));
+  keys.add(artifactKeys(docs[3])[0]);
+  assert.deepEqual(selectCachedDocuments(docs,keys,2).map(d=>d.document_id),['a','c']);
+  assert.throws(()=>selectCachedDocuments(docs,keys,4),/Only 3/);
+});

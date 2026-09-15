@@ -3,6 +3,7 @@
 require("dotenv").config();
 
 const { BigQuery } = require("@google-cloud/bigquery");
+const { isArticleUrl } = require("./knowledge/staged-load.cjs");
 const { Storage } = require("@google-cloud/storage");
 
 const GCP_PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
@@ -15,6 +16,7 @@ const BQ_GRAPH_TABLE = process.env.BQ_GRAPH_TABLE || "graph_edges";
 const BQ_CRAWL_RUNS_TABLE = process.env.BQ_CRAWL_RUNS_TABLE || "crawl_runs";
 const BQ_CRAWL_ATTEMPTS_TABLE = process.env.BQ_CRAWL_ATTEMPTS_TABLE || "crawl_attempts";
 const BACKFILL_RUN_ID = process.env.BACKFILL_RUN_ID || process.argv[2];
+const STAGE_ONLY = process.env.BACKFILL_STAGE_ONLY === 'true';
 const KEEP_STAGE = process.env.BACKFILL_KEEP_STAGE === "true";
 
 if (!GCP_PROJECT_ID) throw new Error("GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT is required.");
@@ -169,6 +171,7 @@ async function loadJsonlIntoTable(tableName, files) {
   await bigQuery.dataset(BQ_DATASET).table(tableName).load(files, {
     sourceFormat: "NEWLINE_DELIMITED_JSON",
     writeDisposition: "WRITE_TRUNCATE",
+    location: GCP_LOCATION,
   });
 }
 
@@ -239,52 +242,10 @@ async function mergeStagingTables(tables) {
           AND staged.content_hash = target.content_hash
       );
 
-    MERGE ${bqTableRef(BQ_GRAPH_TABLE)} AS target
-    USING (
-      SELECT * FROM ${bqTableRef(tables.graph)}
-      QUALIFY ROW_NUMBER() OVER (PARTITION BY edge_id ORDER BY created_at DESC) = 1
-    ) AS source
-    ON target.edge_id = source.edge_id
-    WHEN MATCHED THEN UPDATE SET
-      document_id = source.document_id,
-      source_url = source.source_url,
-      source_id = source.source_id,
-      source_label = source.source_label,
-      source_type = source.source_type,
-      source_description = source.source_description,
-      target_id = source.target_id,
-      target_label = source.target_label,
-      target_type = source.target_type,
-      target_description = source.target_description,
-      relation = source.relation,
-      content_hash = source.content_hash,
-      crawl_batch_id = source.crawl_batch_id,
-      metadata_json = source.metadata_json,
-      created_at = source.created_at
-    WHEN NOT MATCHED THEN INSERT (
-      edge_id, document_id, source_url, source_id, source_label, source_type, source_description,
-      target_id, target_label, target_type, target_description, relation, content_hash, crawl_batch_id,
-      metadata_json, created_at
-    ) VALUES (
-      source.edge_id, source.document_id, source.source_url, source.source_id, source.source_label,
-      source.source_type, source.source_description, source.target_id, source.target_label, source.target_type,
-      source.target_description, source.relation, source.content_hash, source.crawl_batch_id, source.metadata_json,
-      source.created_at
-    );
-
-    DELETE FROM ${bqTableRef(BQ_GRAPH_TABLE)} AS target
-    WHERE EXISTS (
-      SELECT 1 FROM ${bqTableRef(tables.corpus)} AS staged
-      WHERE staged.document_id = target.document_id
-    )
-      AND NOT EXISTS (
-        SELECT 1 FROM ${bqTableRef(tables.corpus)} AS staged
-        WHERE staged.document_id = target.document_id
-          AND staged.content_hash = target.content_hash
-      );
-
-    INSERT INTO ${bqTableRef(BQ_CRAWL_ATTEMPTS_TABLE)}
-    SELECT * FROM ${bqTableRef(tables.attempts)};
+    MERGE ${bqTableRef(BQ_CRAWL_ATTEMPTS_TABLE)} target
+    USING ${bqTableRef(tables.attempts)} source
+    ON target.run_id=source.run_id AND target.url=source.url AND target.status=source.status AND target.created_at=source.created_at
+    WHEN NOT MATCHED THEN INSERT ROW;
 
     COMMIT TRANSACTION;
   `);
@@ -303,7 +264,7 @@ async function countTable(table) {
 async function main() {
   console.log(`Loading staged backfill ${BACKFILL_RUN_ID} without crawling.`);
   await ensureBigQueryStore();
-  const runKey = BACKFILL_RUN_ID.replace(/[^A-Za-z0-9_]+/g, "_").slice(0, 40);
+  const runKey = BACKFILL_RUN_ID.replace(/[^A-Za-z0-9_]+/g, "_").slice(0, 40) + "_recovery";
   const stagingTables = await createStagingTables(runKey);
   const files = {
     corpus: await listShardFiles("corpus"),
@@ -331,7 +292,23 @@ async function main() {
   };
   console.log("Staged row counts:", stagedCounts);
 
+  const [validation] = await runBigQuery(`SELECT
+    (SELECT COUNT(*) FROM ${bqTableRef(stagingTables.corpus)} WHERE document_id IS NULL OR TRIM(COALESCE(content,''))='') AS bad_documents,
+    (SELECT COUNT(*) FROM ${bqTableRef(stagingTables.chunks)} c LEFT JOIN ${bqTableRef(stagingTables.corpus)} d ON c.document_id=d.document_id AND c.content_hash=d.content_hash
+      WHERE d.document_id IS NULL OR ARRAY_LENGTH(c.embedding)!=768 OR TRIM(COALESCE(c.content,''))='') AS bad_chunks,
+    (SELECT COUNT(*)-COUNT(DISTINCT document_id) FROM ${bqTableRef(stagingTables.corpus)}) AS duplicate_documents,
+    (SELECT COUNT(*)-COUNT(DISTINCT chunk_id) FROM ${bqTableRef(stagingTables.chunks)}) AS duplicate_chunks`);
+  if (!stagedCounts.corpus || !stagedCounts.chunks || Object.values(validation).some(value=>Number(value)!==0)) throw new Error(`Invalid staged data: ${JSON.stringify(validation)}`);
+  console.log('Staged validation passed:', validation);
+  const failures=await runBigQuery(`SELECT url,error FROM ${bqTableRef(stagingTables.attempts)} WHERE status='FAILED'`);
+  const recovered=JSON.parse(process.env.BACKFILL_RECOVERED_URLS || '[]');
+  const unresolved=failures.filter(row=>isArticleUrl(row.url) && !recovered.includes(row.url));
+  if (STAGE_ONLY) {console.log('Crawl failures:',failures);return;}
+  if(unresolved.length)throw new Error(`Unresolved article sources: ${JSON.stringify(unresolved)}`);
   await mergeStagingTables(stagingTables);
+  const receipt={runId:BACKFILL_RUN_ID,rows:stagedCounts,failures,recovered,graphUnchanged:true,mergedAt:new Date().toISOString()};
+  await storage.bucket(GCS_RAW_BUCKET).file(`backfills/${BACKFILL_RUN_ID}/recovery.json`).save(JSON.stringify(receipt),{resumable:false,contentType:'application/json'});
+  await storage.bucket(GCS_RAW_BUCKET).file('knowledge-pipeline/corpus-version.json').save(JSON.stringify({version:`${BACKFILL_RUN_ID}:${receipt.mergedAt}`}),{resumable:false,contentType:'application/json'});
   const discoveryUri = `gs://${GCS_RAW_BUCKET}/backfills/${BACKFILL_RUN_ID}/discovery/discovered-urls.jsonl`;
   await runBigQuery(`
     INSERT INTO ${bqTableRef(BQ_CRAWL_RUNS_TABLE)} (

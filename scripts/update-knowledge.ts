@@ -15,9 +15,10 @@ async function main() {
   const store=new CloudStore(new Storage({projectId:project}),bucket,PREFIX);
   const built=process.argv[1].endsWith('.cjs');
   const run = (script:string,args:string[],env:Record<string,string>={}) => new Promise<void>((resolve,reject)=>{
-    const child=spawn(process.execPath,built ? [`dist/${script}.cjs`,...args] : ['--import','tsx',`scripts/${script}.ts`,...args],{stdio:'inherit',env:{...process.env,...env}});
+    const child=spawn(process.execPath,built ? [`dist/${script}.cjs`,...args] : ['--import','tsx',`scripts/${script}.ts`,...args],{stdio:['ignore','inherit','pipe'],env:{...process.env,...env}});
+    let detail='';child.stderr?.on('data',data=>{process.stderr.write(data);detail=(detail+data.toString()).slice(-2000);});
     child.once('error',reject);
-    child.once('exit',(code,signal)=>code===0 ? resolve() : reject(new Error(`${script} failed (${signal || code})`)));
+    child.once('exit',(code,signal)=>code===0 ? resolve() : reject(new Error(`${script} failed (${signal || code}): ${detail.trim()}`)));
   });
   const execution=process.env.CLOUD_RUN_EXECUTION ? `projects/${project}/locations/${process.env.GCP_LOCATION || 'asia-southeast1'}/jobs/${process.env.CLOUD_RUN_JOB}/executions/${process.env.CLOUD_RUN_EXECUTION}` : undefined;
   await runUpdate(store,runId,async(stage,state)=>{

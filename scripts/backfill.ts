@@ -1,5 +1,7 @@
+import { loadGcsShards, isArticleUrl } from './knowledge/staged-load.cjs';
 import dotenv from "dotenv";
 import { CloudStore, PREFIX } from "./knowledge/cloud";
+import { changeUpdate, type UpdateState } from './knowledge/update-flow';
 import { reuseOrCrawl } from "./knowledge/crawl-cache";
 import fs from "fs";
 import os from "os";
@@ -590,6 +592,7 @@ async function discoverSourceUrls(source: CrawlSource, existingDocuments: Map<st
 
   const now = nowIso();
   return Array.from(discovered)
+    .filter(isArticleUrl)
     .sort()
     .map(url => ({
       run_id: BACKFILL_RUN_ID,
@@ -1178,11 +1181,8 @@ async function publishToKnowledgeCatalog(document: CrawledDocument, documentId: 
 }
 
 async function loadJsonlIntoTable(tableName: string, gcsUris: string[]): Promise<void> {
-  if (gcsUris.length === 0) return;
-  await (bigQuery.dataset(BQ_DATASET).table(tableName) as any).load(gcsUris, {
-    sourceFormat: "NEWLINE_DELIMITED_JSON",
-    writeDisposition: "WRITE_TRUNCATE",
-  });
+  await loadGcsShards(bigQuery.dataset(BQ_DATASET).table(tableName), storage, gcsUris,
+    GCS_RAW_BUCKET, `backfills/${BACKFILL_RUN_ID}/load/`, GCP_LOCATION);
 }
 
 async function createStagingTables(runKey: string): Promise<Record<string, string>> {
@@ -1474,6 +1474,8 @@ async function main(): Promise<void> {
   });
 
   await Promise.all(Object.values(writers).map(writer => writer.flush()));
+  const updateStore = new CloudStore(storage, GCS_RAW_BUCKET, PREFIX);
+  if ((await updateStore.read<UpdateState>('update.json'))?.runId === BACKFILL_RUN_ID) await changeUpdate(updateStore, BACKFILL_RUN_ID, {phase:'load'});
   const runKey = BACKFILL_RUN_ID.replace(/[^A-Za-z0-9_]+/g, "_").slice(0, 40);
   const stagingTables = await createStagingTables(runKey);
   await loadJsonlIntoTable(stagingTables.corpus, writers.corpus.uris);
@@ -1481,6 +1483,7 @@ async function main(): Promise<void> {
   await loadJsonlIntoTable(stagingTables.graph, writers.graph.uris);
   await loadJsonlIntoTable(stagingTables.attempts, writers.attempts.uris);
   await mergeStagingTables(stagingTables);
+  await storage.bucket(GCS_RAW_BUCKET).file(`${PREFIX}/corpus-version.json`).save(JSON.stringify({version:`${BACKFILL_RUN_ID}:${nowIso()}`}),{resumable:false,contentType:'application/json'});
   const [attemptCounts] = await runBigQuery(`SELECT COUNTIF(status = 'FAILED') AS failed FROM ${bqTableRef(stagingTables.attempts)}`);
   if (Number(attemptCounts?.failed || 0) > 0 && !BACKFILL_EXTRACT_GRAPH) throw new Error(`${attemptCounts.failed} new URLs failed; successful sources are saved for the next update.`);
 

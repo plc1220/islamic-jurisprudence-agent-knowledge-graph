@@ -97,7 +97,7 @@ export function registerKnowledgeRoutes(app: Express, overrides: { store?: Cloud
       const crawl=state?.phase==='crawl' ? await crawlProgressFor(state) : {crawlProgress:null,progressUnavailable:false};
       const usage=state ? await store.read<UsageSummary>(`runs/${state.runId}/usage.json`) : null;
       res.setHeader('Cache-Control','no-store');
-      res.json({enabled,admin,model:MODEL,active:active ? {version:active.version,documents:active.documents,edges:active.edges}:null,update:state ? {runId:state.runId,phase:state.phase,updatedAt:state.updatedAt,requestedAt:state.requestedAt}:null,progress,usage,...crawl,checkedAt:new Date().toISOString()});
+      res.json({enabled,admin,model:MODEL,active:active ? {version:active.version,documents:active.documents,edges:active.edges}:null,update:state ? {runId:state.runId,phase:state.phase,updatedAt:state.updatedAt,requestedAt:state.requestedAt,error:state.error,failedPhase:state.failedPhase,completedStages:state.completedStages,coverageWarnings:state.coverageWarnings}:null,progress,usage,...crawl,checkedAt:new Date().toISOString()});
     }catch(error:any){console.error('Knowledge status:',error.message);res.status(503).json({error:'Status tidak tersedia.'});}
   });
   app.post('/api/knowledge/update',async(req,res)=>{
@@ -107,8 +107,9 @@ export function registerKnowledgeRoutes(app: Express, overrides: { store?: Cloud
       const current=await store.readVersioned<UpdateState>('update.json');
       if(isRunning(current?.value||null)) return res.status(202).json({runId:current!.value.runId,existing:true});
       const active=await store.read<Release>('active.json');
-      runId=`update-${randomUUID()}`;
-      const state:UpdateState={runId,phase:'queued',requestedAt:new Date().toISOString(),updatedAt:new Date().toISOString(),expectedActive:active?.version || null};
+      const resumable=current?.value.phase==='failed' && current.value.completedStages?.length && current.value.expectedActive===(active?.version || null);
+      runId=resumable ? current!.value.runId : `update-${randomUUID()}`;
+      const state:UpdateState={...(resumable ? current!.value : {}),runId,error:'',operation:undefined,execution:undefined,failedPhase:'',phase:'queued',requestedAt:new Date().toISOString(),updatedAt:new Date().toISOString(),expectedActive:active?.version || null};
       await store.compareAndSwap('update.json',state,current?.generation || 0);
       const operation=await request('POST',`${jobPath}:run`,{overrides:{taskCount:1,containerOverrides:[{args:['dist/update-knowledge.cjs','--run-id',runId]}]}});
       // Worker may already have advanced the phase; merge just the operation name.

@@ -1,3 +1,4 @@
+import { relevantKeywordMatch } from './scripts/knowledge/relevance';
 import express from "express";
 import { registerKnowledgeRoutes } from "./scripts/knowledge/routes";
 import { CloudStore, PREFIX, validateRelease, type Release } from "./scripts/knowledge/cloud";
@@ -164,7 +165,7 @@ type GraphExtraction = {
 type Citation = {
   title: string;
   url: string;
-  source: "bigquery-vector" | "knowledge-catalog-graph" | "local-memory";
+  source: "bigquery-vector" | "bigquery-keyword" | "knowledge-catalog-graph" | "local-memory";
   documentId?: string;
   chunkIndex?: number;
   snippet?: string;
@@ -177,6 +178,7 @@ type RetrievedChunk = {
   chunkId: string;
   chunkIndex: number;
   metadataJson?: string;
+  retrievalMethod?: "bigquery-vector" | "bigquery-keyword";
   score?: number;
 };
 type RetrievedGraphTriple = {
@@ -1131,6 +1133,7 @@ function normalizeTextForSearch(input: string): string {
 
 function canonicalizeFiqhTerm(word: string): string {
   const aliases: Record<string, string> = {
+    qadha: "qada",
     feqah: "fiqh",
     fekah: "fiqh",
     fiqah: "fiqh",
@@ -1217,8 +1220,9 @@ function chatResponseCacheKey(message: string, history: any[], graphVersion = "l
     }));
 
   return cacheKey("chat-response", {
-    cacheVersion: 2,
+    cacheVersion: 3,
     graphVersion,
+    corpusVersion: activeCorpusVersion,
     knowledgeVersion: knowledgeCacheVersion,
     model: CHAT_MODEL,
     message: normalizeTextForSearch(message),
@@ -1234,6 +1238,7 @@ function markKnowledgeChanged(): void {
 }
 
 // Readers poll a small release pointer, not the corpus. A request pins one release.
+let activeCorpusVersion = "legacy";
 let activeGraphRelease: Release | null = null;
 let graphReleaseCheckedAt = 0;
 let graphReleaseCheck: Promise<Release | null> | null = null;
@@ -1245,6 +1250,8 @@ async function resolveGraphRelease(): Promise<Release | null> {
   graphReleaseCheck = (async () => {
     const store = new CloudStore(new Storage({ projectId: GCP_PROJECT_ID }), bucket, PREFIX);
     const release = await store.read<Release>('active.json');
+    const corpusVersion = (await store.read<{version:string}>('corpus-version.json'))?.version || 'legacy';
+    if(corpusVersion !== activeCorpusVersion) { activeCorpusVersion=corpusVersion;markKnowledgeChanged(); }
     if (release) validateRelease(release);
     if ((release?.version || 'legacy') !== (activeGraphRelease?.version || 'legacy')) markKnowledgeChanged();
     activeGraphRelease = release;
@@ -2295,7 +2302,7 @@ function chunkCitation(chunk: RetrievedChunk): Citation {
   return {
     title: chunk.title || chunk.sourceUrl || "BigQuery source",
     url: chunk.sourceUrl,
-    source: "bigquery-vector",
+    source: chunk.retrievalMethod || "bigquery-vector",
     documentId: chunk.documentId,
     chunkIndex: chunk.chunkIndex,
     snippet: truncateText(chunk.content, 240),
@@ -2321,7 +2328,7 @@ function filterRelevantChunks(chunks: RetrievedChunk[], keywords: string[]): Ret
 
     // One highly specific term is enough; otherwise require more overlap so
     // generic portal/navigation pages do not become false citations.
-    return matches.some(match => match.length >= 8) || matches.length >= 2;
+    return relevantKeywordMatch(matches, keywords, getTextKeywordMatches(chunk.title || '', keywords));
   });
 }
 
@@ -2335,6 +2342,21 @@ function filterRelevantTriples(triples: RetrievedGraphTriple[], keywords: string
   });
 }
 
+async function searchBigQueryKeywordChunks(keywords: string[]): Promise<RetrievedChunk[]> {
+  if(!keywords.length) return [];
+  const terms = [...new Set(keywords.flatMap(term=>term==='qada' ? ['qada','qadha'] : [term]))].slice(0,8);
+  const rows = await runBigQuery(`
+    WITH scored AS (SELECT c.*, (SELECT COUNT(*) FROM UNNEST(@terms) term WHERE STRPOS(LOWER(CONCAT(COALESCE(c.title,''),' ',c.content)),term)>0) AS matches,
+      (SELECT COUNT(*) FROM UNNEST(@terms) term WHERE STRPOS(LOWER(COALESCE(c.title,'')),term)>0) AS title_matches
+    FROM ${bqTableRef(BQ_CHUNKS_TABLE)} c
+    WHERE NOT REGEXP_CONTAINS(c.source_url,r'[?&](start|page|offset)=')
+      AND EXISTS (SELECT 1 FROM UNNEST(@terms) term WHERE STRPOS(LOWER(CONCAT(COALESCE(c.title,''),' ',c.content)),term)>0)
+    ) SELECT * FROM scored
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY document_id ORDER BY matches DESC,title_matches DESC,chunk_index)=1
+    ORDER BY matches DESC,title_matches DESC,document_id LIMIT 12`, {terms});
+  return rows.map(row=>({content:row.content || '',title:row.title || row.source_url,sourceUrl:row.source_url,documentId:row.document_id,chunkId:row.chunk_id,chunkIndex:Number(row.chunk_index),retrievalMethod:'bigquery-keyword' as const}));
+}
+
 async function searchBigQueryVectorChunks(ai: GoogleGenAI, message: string, limit: number = 3): Promise<RetrievedChunk[]> {
   if (!isGcpNativeConfigured()) return [];
 
@@ -2342,6 +2364,7 @@ async function searchBigQueryVectorChunks(ai: GoogleGenAI, message: string, limi
     const key = cacheKey("vector-retrieval", {
       version: knowledgeCacheVersion,
       model: getEmbeddingModelName(),
+      corpusVersion: activeCorpusVersion,
       query: normalizeQueryForCache(message),
       limit,
     });
@@ -3295,6 +3318,7 @@ app.post("/api/chat", async (req, res) => {
       "Tugas anda adalah memberikan pandangan fekah, pemahaman hadis, fatwa, dan rujukan sejarah yang sahih. " +
       "Sentiasa utamakan pandangan Mazhab Syafi'i, keputusan Majlis Raja-Raja, fatwa JAKIM, e-Khutbah serta Jabatan Mufti Wilayah Persekutuan (muftiwp.gov.my). " +
       "Bahasa komunikasi mestilah Bahasa Melayu/Malaysia yang sopan, akademik, dan mudah difahami. " +
+      "Jika soalan terlalu ringkas atau kabur (contohnya qada tanpa menyatakan solat atau puasa), minta penjelasan sebelum memberi keputusan hukum khusus. " +
       "Cakap dengan sandaran dalil yang jelas dari Al-Quran dan Al-Sunnah jika bersesuaian, dan nyatakan sumber rujukan fatwa secara eksplisit. " +
       "Apabila pengguna bertanyakan isu semasa, gunakan hanya keputusan mufti yang sah di Malaysia apabila rujukannya wujud dalam katalog pengetahuan.";
 
@@ -3311,7 +3335,8 @@ app.post("/api/chat", async (req, res) => {
           searchBigQueryVectorChunks(ai, message, 5),
           searchBigQueryGraphTriples(keywords, 10, graphRelease),
         ]);
-        const vectorChunks = filterRelevantChunks(rawVectorChunks, keywords).slice(0, 3);
+        let vectorChunks = filterRelevantChunks(rawVectorChunks, keywords).slice(0, 3);
+        if (!vectorChunks.length) vectorChunks = filterRelevantChunks(await searchBigQueryKeywordChunks(keywords),keywords).slice(0,3);
         const graphTriples = filterRelevantTriples(rawGraphTriples, keywords);
 
         if (vectorChunks.length > 0 || graphTriples.length > 0) {

@@ -232,3 +232,28 @@ test('status exposes cached progress only to admins and refreshes when execution
     for(const key of keys){if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key];}
   }
 });
+
+import { loadGcsShards, isArticleUrl } from '../scripts/knowledge/staged-load.cjs';
+import { Storage } from '@google-cloud/storage';
+test('staged loader passes Storage File objects and propagates load failures',async()=>{
+ const storage=new Storage({projectId:'fixture-project'});let calls=0;
+ const table={load:async(files:any[],options:any)=>{calls++;assert.equal(files.length,2);assert.equal(files[0].bucket.name,'fixture');assert.equal(files[1].name,'backfills/run/load/chunks-1.jsonl');assert.equal(options.location,'asia-southeast1');return [{}];}};
+ await loadGcsShards(table,storage,['gs://fixture/backfills/run/load/chunks-0.jsonl','gs://fixture/backfills/run/load/chunks-1.jsonl'],'fixture','backfills/run/load/','asia-southeast1');
+ await loadGcsShards(table,storage,[],'fixture','backfills/run/load/','asia-southeast1');assert.equal(calls,1);
+ await assert.rejects(loadGcsShards(table,storage,['gs://other/outside.jsonl'],'fixture','backfills/run/load/','asia-southeast1'));
+ await assert.rejects(loadGcsShards({load:async()=>[{status:{errorResult:{message:'Bad input'}}}]} as any,storage,['gs://fixture/backfills/run/load/a.jsonl'],'fixture','backfills/run/load/','asia-southeast1'),/Bad input/);
+ assert.equal(isArticleUrl('https://example.test/a.css?ver=1'),false);assert.equal(isArticleUrl('https://example.test/xmlrpc.php?rsd='),false);assert.equal(isArticleUrl('https://example.test/article'),true);
+});
+test('resume skips a completed crawl and never publishes after failed extraction',async()=>{
+ const store=new VersionedMemory();store.values.set('update.json',{...updateState(),phase:'failed',completedStages:['crawl']});const stages:string[]=[];
+ await assert.rejects(runUpdate(store as any,'fixture-update',async stage=>{stages.push(stage);throw new Error('Model unavailable');}));
+ assert.deepEqual(stages,['extract']);const state=await store.read<UpdateState>('update.json');assert.equal(state?.failedPhase,'extract');assert.deepEqual(state?.completedStages,['crawl']);
+});
+
+import { relevantKeywordMatch } from '../scripts/knowledge/relevance';
+test('one meaningful keyword can match an article title without accepting incidental body mentions',()=>{
+ assert.equal(relevantKeywordMatch(['qada'],['qada'],['qada']),true);
+ assert.equal(relevantKeywordMatch(['qada'],['qada'],[]),false);
+ assert.equal(relevantKeywordMatch([],['qada'],['qada']),false);
+ assert.equal(relevantKeywordMatch(['qada','puasa'],['qada','puasa'],[]),true);
+});

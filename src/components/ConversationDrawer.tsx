@@ -1,50 +1,29 @@
-import { useEffect, useRef } from 'react';
-import { createPortal } from 'react-dom';
-import { MessageSquare, Plus, X } from 'lucide-react';
+import { MessageSquare, Plus, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import type { Conversation } from '../lib/conversations';
 import { Button } from './Button';
 
 type Props = {
   open: boolean;
-  onClose: () => void;
+  onToggle: () => void;
   conversations: Conversation[];
   activeId: string;
   disabled: boolean;
   onSelect: (id?: string) => void;
 };
 
-export function ConversationDrawer({ open, onClose, conversations, activeId, disabled, onSelect }: Props) {
-  const dialogRef = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!open || !dialog) return;
-    const previousFocus = document.activeElement as HTMLElement | null;
-    const previousOverflow = document.body.style.overflow;
-    dialog.showModal();
-    document.body.style.overflow = 'hidden';
-    return () => {
-      dialog.close();
-      document.body.style.overflow = previousOverflow;
-      previousFocus?.focus();
-    };
-  }, [open]);
-
-  return createPortal(
-    <dialog ref={dialogRef} id="conversation-history" className="conversation-drawer" aria-labelledby="conversation-history-title"
-      onCancel={onClose}
-      onClick={event => {
-        if (event.target !== event.currentTarget) return;
-        const bounds = event.currentTarget.getBoundingClientRect();
-        if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) onClose();
-      }}>
-      <div className="flex h-full flex-col">
-        <div className="flex items-center justify-between gap-3 px-5 pt-5 pb-4">
-          <h2 id="conversation-history-title" className="text-lg font-semibold text-emerald-950">Sejarah sembang</h2>
-          <Button variant="ghost" onClick={onClose} aria-label="Tutup sejarah sembang" autoFocus><X className="h-4 w-4" /></Button>
-        </div>
-        <div className="px-4 pb-4">
-          <Button className="w-full justify-center" disabled={disabled} onClick={() => onSelect()}><Plus className="h-4 w-4" />Sembang baharu</Button>
-        </div>
+export function ConversationDrawer({ open, onToggle, conversations, activeId, disabled, onSelect }: Props) {
+  return (
+    <aside id="conversation-history" className={`conversation-drawer ${open ? 'is-open' : 'is-collapsed'}`} aria-label="Sejarah sembang">
+      <div className="drawer-controls">
+        {open && <h2 className="text-base font-semibold text-emerald-950">Sejarah sembang</h2>}
+        <Button variant="ghost" onClick={onToggle} aria-expanded={open} aria-controls="conversation-list" aria-label={open ? 'Kecilkan panel sembang' : 'Buka panel sembang'} title={open ? 'Kecilkan panel sembang' : 'Buka panel sembang'}>
+          {open ? <PanelLeftClose className="h-5 w-5" /> : <PanelLeftOpen className="h-5 w-5" />}
+        </Button>
+      </div>
+      <div className="drawer-new-chat">
+        <Button className="w-full justify-center" disabled={disabled} onClick={() => onSelect()} aria-label="Sembang baharu" title="Sembang baharu"><Plus className="h-4 w-4" />{open && 'Sembang baharu'}</Button>
+      </div>
+      {open && <div id="conversation-list" className="flex min-h-0 flex-1 flex-col">
         <nav aria-label="Perbualan terdahulu" className="min-h-0 flex-1 overflow-y-auto border-y border-stone-200 px-3 py-3">
           {conversations.length ? <ul className="space-y-1">
             {conversations.map(conversation => <li key={conversation.id}>
@@ -60,7 +39,7 @@ export function ConversationDrawer({ open, onClose, conversations, activeId, dis
           </ul> : <p className="p-3 text-sm text-stone-500">Belum ada sejarah sembang.</p>}
         </nav>
         <p className="p-5 text-xs leading-relaxed text-stone-500">Disimpan dalam pelayar ini, tanpa log masuk. Sejarah tidak dikongsi antara peranti dan hilang jika data pelayar dipadam.</p>
-      </div>
-    </dialog>, document.body,
+      </div>}
+    </aside>
   );
 }

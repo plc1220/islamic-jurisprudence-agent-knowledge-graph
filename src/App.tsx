@@ -2,8 +2,6 @@ import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   MessageSquare,
-  Plus,
-  History,
   Network,
   BookOpen,
   Compass,
@@ -75,7 +73,7 @@ export default function App() {
   const hadLocalArchive = useRef(Boolean(conversationArchive));
   const [conversationId, setConversationId] = useState(()=>conversationArchive?.activeId || crypto.randomUUID());
   const initialConversation = conversationArchive?.conversations.find(c=>c.id===conversationArchive.activeId);
-  const [historyOpen,setHistoryOpen] = useState(false);
+  const [historyOpen,setHistoryOpen] = useState(() => window.matchMedia("(min-width: 900px)").matches);
   const [historyError,setHistoryError] = useState('');
   // Chat State
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => initialConversation?.messages.length ? initialConversation.messages : [createWelcomeMessage()]);
@@ -330,7 +328,7 @@ export default function App() {
     const draft=target?.draft || '';
     persistConversationArchive(saveConversation(current,nextId,messages,draft));
     setConversationId(nextId);setChatMessages(messages);setUserInput(draft);
-    setChatError(null);setStreamingMessageId(null);setHistoryOpen(false);setFeedbackModal(null);
+    setChatError(null);setStreamingMessageId(null);if (window.innerWidth < 900) setHistoryOpen(false);setFeedbackModal(null);
   };
 
   // Keep the selected detail panel aligned with refreshed or restored graph data.
@@ -534,7 +532,7 @@ export default function App() {
   }, [successNotice]);
 
   return (
-    <div className="app-shell min-h-screen font-sans antialiased flex flex-col">
+    <div className={`app-shell min-h-screen font-sans antialiased flex flex-col ${activeTab === "chat" ? `with-chat-drawer ${historyOpen ? "drawer-expanded" : "drawer-collapsed"}` : ""}`}>
       
       <header className="app-header"><div className="app-header-inner"><div className="brand"><span className="brand-icon"><Compass /></span><div><h1 aria-label="Mursyid AI">Mursyid<span>AI</span></h1><p>Ruang ilmu Syariah</p></div></div><span className="brand-note">Berpandukan sumber. Memahami konteks.</span></div></header>
 
@@ -598,15 +596,7 @@ export default function App() {
                 transition={{ duration: 0.2 }}
                 className="chat-layout"
               >
-                <div className="space-y-3">
-                  <div className="flex flex-wrap items-center gap-3">
-                    <Button disabled={isChatLoading || !isSessionHydrated} onClick={()=>openConversation()}><Plus className="h-4 w-4"/>Sembang baharu</Button>
-                    <Button variant="ghost" aria-expanded={historyOpen} aria-controls="conversation-history" onClick={()=>setHistoryOpen(!historyOpen)}><History className="h-4 w-4"/>Sejarah sembang</Button>
-                  </div>
-                  <p className="text-xs text-stone-500">Disimpan dalam pelayar ini, tanpa log masuk. Sejarah tidak dikongsi antara peranti dan hilang jika data pelayar dipadam.</p>
-                  {historyError && <p role="alert" className="text-sm text-rose-700">{historyError}</p>}
-
-                </div>
+                {historyError && <p role="alert" className="text-sm text-rose-700">{historyError}</p>}
                 {/* Side presets & resource instructions */}
                 {chatMessages.length <= 1 && <div className="chat-suggestions space-y-4 text-left">
                   {/* Preset Questions selection */}
@@ -1160,7 +1150,7 @@ export default function App() {
         </div>
       )}
 
-      <ConversationDrawer open={historyOpen} onClose={() => setHistoryOpen(false)} conversations={conversationArchive?.conversations || []} activeId={conversationId} disabled={isChatLoading || !isSessionHydrated} onSelect={openConversation} />
+      {activeTab === "chat" && <ConversationDrawer open={historyOpen} onToggle={() => setHistoryOpen(value => !value)} conversations={conversationArchive?.conversations || []} activeId={conversationId} disabled={isChatLoading || !isSessionHydrated} onSelect={openConversation} />}
 
       <footer className="app-footer">Mursyid AI · Ilmu dengan konteks dan rujukan</footer>
 

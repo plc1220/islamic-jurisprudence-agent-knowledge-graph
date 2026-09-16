@@ -118,3 +118,10 @@ button, a, input, select, textarea { -webkit-tap-highlight-color: transparent; }
   .with-chat-drawer.drawer-expanded { margin-left: 60px; }
   .conversation-drawer.is-open { width: min(280px, calc(100vw - 32px)); box-shadow: 12px 0 40px #163c3026; }
 }
+
+.library-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.library-toolbar select { background: white; border: 1px solid #dce5df; border-radius: 8px; padding: 8px 12px; }
+.library-list { display: flex; flex-direction: column; gap: 10px; }
+.library-list .article-card { width: 100%; padding: 18px 22px; }
+.library-list .article-card h3 { margin: 6px 0; -webkit-line-clamp: 2; }
+.library-list .article-card > p { margin-bottom: 10px; -webkit-line-clamp: 2; }

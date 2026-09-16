@@ -3532,16 +3532,18 @@ app.get('/api/library', async (req, res) => {
   const q = String(req.query.q || '').trim().slice(0, 200);
   const source = String(req.query.source || '').slice(0, 200);
   const page = Math.min(10000, Math.max(0, Number.parseInt(String(req.query.page || '0'), 10) || 0));
+  const requestedSize = Number(req.query.pageSize || 12);
+  const pageSize = [12, 24, 48, 96].includes(requestedSize) ? requestedSize : 12;
   try {
     const [rows, sources] = await Promise.all([
       runBigQuery(`WITH corpus AS (${libraryCorpusSql()})
         SELECT document_id, title, source_name, source_url, SUBSTR(content, 1, 240) AS excerpt
         FROM corpus WHERE (@q = '' OR STRPOS(LOWER(title), LOWER(@q)) > 0 OR STRPOS(LOWER(content), LOWER(@q)) > 0)
         AND (@source = '' OR source_name = @source)
-        ORDER BY updated_at DESC, document_id LIMIT 13 OFFSET @offset`, { q, source, offset: page * 12 }),
+        ORDER BY updated_at DESC, document_id LIMIT @limit OFFSET @offset`, { q, source, limit: pageSize + 1, offset: page * pageSize }),
       runBigQuery(`SELECT DISTINCT source_name FROM ${bqTableRef(BQ_CORPUS_TABLE)} WHERE source_name != '' AND document_id != 'baseline' ORDER BY source_name`)
     ]);
-    res.json({ articles: rows.slice(0, 12), hasMore: rows.length > 12, sources: sources.map(row => row.source_name) });
+    res.json({ articles: rows.slice(0, pageSize), hasMore: rows.length > pageSize, sources: sources.map(row => row.source_name) });
   } catch (error: any) {
     console.error('Library read failed:', error.message);
     res.status(503).json({ error: 'Pustaka tidak dapat dimuatkan. Sila cuba lagi.' });

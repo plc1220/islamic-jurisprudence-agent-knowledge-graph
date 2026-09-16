@@ -30,6 +30,7 @@ import {
 import { CONVERSATIONS_KEY, loadArchive, saveConversation, type ConversationArchive } from "./lib/conversations";
 import { PRESET_QUESTIONS, INITIAL_NODES, INITIAL_LINKS } from "./data";
 import { KnowledgeGraph } from "./components/KnowledgeGraph";
+import { ConversationDrawer } from "./components/ConversationDrawer";
 import { Library } from "./components/Library";
 import { Button } from "./components/Button";
 import { CurationPlan } from "./components/CurationPlan";
@@ -604,13 +605,7 @@ export default function App() {
                   </div>
                   <p className="text-xs text-stone-500">Disimpan dalam pelayar ini, tanpa log masuk. Sejarah tidak dikongsi antara peranti dan hilang jika data pelayar dipadam.</p>
                   {historyError && <p role="alert" className="text-sm text-rose-700">{historyError}</p>}
-                  {historyOpen && <div id="conversation-history" className="rounded-xl border border-stone-200 bg-white p-3 max-h-64 overflow-y-auto" aria-label="Sejarah sembang">
-                    {conversationArchive?.conversations.length ? <ul className="space-y-1">{conversationArchive.conversations.map(conversation=><li key={conversation.id}>
-                      <button type="button" disabled={isChatLoading || !isSessionHydrated} aria-current={conversation.id===conversationId?'true':undefined} onClick={()=>openConversation(conversation.id)} className={`w-full text-left rounded-lg p-3 disabled:opacity-50 ${conversation.id===conversationId?'bg-emerald-50 text-emerald-900':'hover:bg-stone-50'}`}>
-                        <span className="block font-medium break-words">{conversation.title}</span><span className="text-xs text-stone-500">{new Date(conversation.updatedAt).toLocaleString('ms-MY')}</span>
-                      </button>
-                    </li>)}</ul>:<p className="text-sm text-stone-500">Belum ada sejarah sembang.</p>}
-                  </div>}
+
                 </div>
                 {/* Side presets & resource instructions */}
                 {chatMessages.length <= 1 && <div className="chat-suggestions space-y-4 text-left">
@@ -1164,6 +1159,8 @@ export default function App() {
           </div>
         </div>
       )}
+
+      <ConversationDrawer open={historyOpen} onClose={() => setHistoryOpen(false)} conversations={conversationArchive?.conversations || []} activeId={conversationId} disabled={isChatLoading || !isSessionHydrated} onSelect={openConversation} />
 
       <footer className="app-footer">Mursyid AI · Ilmu dengan konteks dan rujukan</footer>
 

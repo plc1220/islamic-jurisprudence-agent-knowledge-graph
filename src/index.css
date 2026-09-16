@@ -94,3 +94,18 @@ button, a, input, select, textarea { -webkit-tap-highlight-color: transparent; }
 @media(max-width: 900px) { .library-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } .curation-steps { grid-template-columns: repeat(2,minmax(0,1fr)); } }
 @media(max-width: 600px) { .app-header-inner { padding: 18px 20px; } .brand-note { display: none; } .library-grid, .curation-steps, .chat-suggestions > div:last-child > div { grid-template-columns: 1fr; } .admin-navigation { margin-left: 0; } .main-navigation { gap: 2px; } .main-navigation .ui-button { padding: 10px; font-size: 12px; } .page-heading { align-items: flex-start; } .library-search select { width: 100%; } .page-heading h2 { font-size: 26px; } }
 @media(prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+
+.conversation-drawer {
+  position: fixed;
+  inset: 0 auto 0 0;
+  margin: 0;
+  width: min(340px, 90vw);
+  max-width: none;
+  height: 100dvh;
+  max-height: none;
+  padding: 0;
+  border: 0;
+  background: #fafaf8;
+  box-shadow: 12px 0 40px #163c3026;
+}
+.conversation-drawer::backdrop { background: #142b2459; }

@@ -10,7 +10,8 @@
     "lint": "tsc --noEmit",
     "graph:pipeline": "tsx scripts/rebuild-graph.ts",
     "test:graph": "tsx --test tests/knowledge-pipeline.test.ts tests/gemini-usage.test.ts",
-    "knowledge:worker": "tsx scripts/update-knowledge.ts"
+    "knowledge:worker": "tsx scripts/update-knowledge.ts",
+    "test:chat": "tsx --test tests/conversations.test.ts"
   },
   "dependencies": {
     "@google-cloud/bigquery": "^8.3.1",

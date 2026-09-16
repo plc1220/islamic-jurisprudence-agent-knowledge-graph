@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   MessageSquare,
+  Plus,
+  History,
   Network,
   BookOpen,
   Compass,
@@ -25,6 +27,7 @@ import {
   KnowledgeLink,
   PersistedAppState,
 } from "./types";
+import { CONVERSATIONS_KEY, loadArchive, saveConversation, type ConversationArchive } from "./lib/conversations";
 import { PRESET_QUESTIONS, INITIAL_NODES, INITIAL_LINKS } from "./data";
 import { KnowledgeGraph } from "./components/KnowledgeGraph";
 import { Library } from "./components/Library";
@@ -65,9 +68,17 @@ export default function App() {
   const [isSessionHydrated, setIsSessionHydrated] = useState(false);
   const [pendingSelectedNodeId, setPendingSelectedNodeId] = useState<string | null>(null);
 
+  // Conversation history belongs to this browser; legacy server sessions are migrated once.
+  const [conversationArchive, setConversationArchive] = useState<ConversationArchive|null>(loadArchive);
+  const archiveRef = useRef(conversationArchive);
+  const hadLocalArchive = useRef(Boolean(conversationArchive));
+  const [conversationId, setConversationId] = useState(()=>conversationArchive?.activeId || crypto.randomUUID());
+  const initialConversation = conversationArchive?.conversations.find(c=>c.id===conversationArchive.activeId);
+  const [historyOpen,setHistoryOpen] = useState(false);
+  const [historyError,setHistoryError] = useState('');
   // Chat State
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => [createWelcomeMessage()]);
-  const [userInput, setUserInput] = useState("");
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => initialConversation?.messages.length ? initialConversation.messages : [createWelcomeMessage()]);
+  const [userInput, setUserInput] = useState(()=>initialConversation?.draft || "");
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
   const [chatError, setChatError] = useState<string | null>(null);
@@ -235,10 +246,10 @@ export default function App() {
         }
 
         if (typeof state.isAgentInfoOpen === "boolean") setIsAgentInfoOpen(state.isAgentInfoOpen);
-        if (typeof state.userInput === "string") setUserInput(state.userInput);
+        if (!hadLocalArchive.current && typeof state.userInput === "string") setUserInput(state.userInput);
 
         const restoredMessages = reviveChatMessages(state.chatMessages);
-        if (restoredMessages.length > 0) {
+        if (!hadLocalArchive.current && restoredMessages.length > 0) {
           setChatMessages(restoredMessages);
         }
 
@@ -298,6 +309,29 @@ export default function App() {
     };
   }, [activeTab, graphSubTab, isAgentInfoOpen, selectedNode, userInput, chatMessages, isSessionHydrated]);
 
+  const persistConversationArchive = (next:ConversationArchive) => {
+    archiveRef.current=next;
+    setConversationArchive(next);
+    try {localStorage.setItem(CONVERSATIONS_KEY,JSON.stringify(next));setHistoryError('');}
+    catch {setHistoryError('Sejarah tidak dapat disimpan dalam pelayar ini. Sembang masih tersedia sehingga halaman ditutup.');}
+  };
+  useEffect(()=>{
+    if(!isSessionHydrated) return;
+    persistConversationArchive(saveConversation(archiveRef.current,conversationId,chatMessages,userInput));
+  },[conversationId,chatMessages,userInput,isSessionHydrated]);
+  const openConversation = (id?:string) => {
+    if(isChatLoading || !isSessionHydrated) return;
+    const current=saveConversation(archiveRef.current,conversationId,chatMessages,userInput);
+    const target=id ? current.conversations.find(c=>c.id===id) : undefined;
+    if(id && !target) return;
+    const nextId=target?.id || crypto.randomUUID();
+    const messages=target?.messages.length ? target.messages : [createWelcomeMessage()];
+    const draft=target?.draft || '';
+    persistConversationArchive(saveConversation(current,nextId,messages,draft));
+    setConversationId(nextId);setChatMessages(messages);setUserInput(draft);
+    setChatError(null);setStreamingMessageId(null);setHistoryOpen(false);setFeedbackModal(null);
+  };
+
   // Keep the selected detail panel aligned with refreshed or restored graph data.
   useEffect(() => {
     if (nodes.length === 0) {
@@ -323,7 +357,7 @@ export default function App() {
   // Send message to Express chat endpoint with BigQuery/Knowledge Catalog grounding
   const handleSendMessage = async (customText?: string) => {
     const textToSend = customText || userInput;
-    if (!textToSend.trim() || isChatLoading) return;
+    if (!textToSend.trim() || isChatLoading || !isSessionHydrated) return;
 
     setUserInput("");
     setChatError(null);
@@ -563,6 +597,21 @@ export default function App() {
                 transition={{ duration: 0.2 }}
                 className="chat-layout"
               >
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <Button disabled={isChatLoading || !isSessionHydrated} onClick={()=>openConversation()}><Plus className="h-4 w-4"/>Sembang baharu</Button>
+                    <Button variant="ghost" aria-expanded={historyOpen} aria-controls="conversation-history" onClick={()=>setHistoryOpen(!historyOpen)}><History className="h-4 w-4"/>Sejarah sembang</Button>
+                  </div>
+                  <p className="text-xs text-stone-500">Disimpan dalam pelayar ini, tanpa log masuk. Sejarah tidak dikongsi antara peranti dan hilang jika data pelayar dipadam.</p>
+                  {historyError && <p role="alert" className="text-sm text-rose-700">{historyError}</p>}
+                  {historyOpen && <div id="conversation-history" className="rounded-xl border border-stone-200 bg-white p-3 max-h-64 overflow-y-auto" aria-label="Sejarah sembang">
+                    {conversationArchive?.conversations.length ? <ul className="space-y-1">{conversationArchive.conversations.map(conversation=><li key={conversation.id}>
+                      <button type="button" disabled={isChatLoading || !isSessionHydrated} aria-current={conversation.id===conversationId?'true':undefined} onClick={()=>openConversation(conversation.id)} className={`w-full text-left rounded-lg p-3 disabled:opacity-50 ${conversation.id===conversationId?'bg-emerald-50 text-emerald-900':'hover:bg-stone-50'}`}>
+                        <span className="block font-medium break-words">{conversation.title}</span><span className="text-xs text-stone-500">{new Date(conversation.updatedAt).toLocaleString('ms-MY')}</span>
+                      </button>
+                    </li>)}</ul>:<p className="text-sm text-stone-500">Belum ada sejarah sembang.</p>}
+                  </div>}
+                </div>
                 {/* Side presets & resource instructions */}
                 {chatMessages.length <= 1 && <div className="chat-suggestions space-y-4 text-left">
                   {/* Preset Questions selection */}
